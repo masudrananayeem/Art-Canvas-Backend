@@ -19,7 +19,23 @@ app.use(
   })
 );
 
-app.get("/", (c) => c.json({ ok: true, service: "art-canvas-backend" }));
+app.get("/", (c) => {
+  const configured = {
+    FIREBASE_PROJECT_ID: !!c.env.FIREBASE_PROJECT_ID && c.env.FIREBASE_PROJECT_ID !== "your-firebase-project-id",
+    FIREBASE_CLIENT_EMAIL: !!c.env.FIREBASE_CLIENT_EMAIL,
+    FIREBASE_PRIVATE_KEY: !!c.env.FIREBASE_PRIVATE_KEY,
+    CLOUDINARY_CLOUD_NAME: !!c.env.CLOUDINARY_CLOUD_NAME && c.env.CLOUDINARY_CLOUD_NAME !== "your-cloudinary-cloud-name",
+    CLOUDINARY_API_KEY: !!c.env.CLOUDINARY_API_KEY,
+    CLOUDINARY_API_SECRET: !!c.env.CLOUDINARY_API_SECRET,
+  };
+  const allSet = Object.values(configured).every(Boolean);
+  return c.json({
+    ok: true,
+    service: "art-canvas-backend",
+    configured,
+    note: allSet ? "All required config detected." : "Some config is missing — see README.md (.dev.vars for local dev, `wrangler secret put` for production).",
+  });
+});
 
 // ---------- helpers ----------
 
@@ -30,6 +46,24 @@ function publicProduct(p) {
 
 function isValidProductInput(body) {
   return body && typeof body.name === "string" && body.name.trim().length > 0 && typeof body.price === "number" && body.price >= 0;
+}
+
+const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "rating", "reviews", "seed", "isFeatured"];
+
+function cleanAddress(a) {
+  if (!a || typeof a !== "object") return null;
+  const pick = (k) => (typeof a[k] === "string" ? a[k].trim().slice(0, 200) : "");
+  const out = {
+    fullName: pick("fullName"),
+    phone: pick("phone"),
+    line1: pick("line1"),
+    line2: pick("line2"),
+    city: pick("city"),
+    state: pick("state"),
+    zip: pick("zip"),
+    country: pick("country"),
+  };
+  return Object.values(out).some(Boolean) ? out : null;
 }
 
 // ---------- products: public ----------
@@ -68,6 +102,7 @@ app.post("/api/admin/products", requireAdmin, async (c) => {
     imagePublicId: body.imagePublicId || "",
     rating: Number.isFinite(body.rating) ? body.rating : 4.8,
     reviews: Number.isFinite(body.reviews) ? body.reviews : 0,
+    isFeatured: body.isFeatured === true,
     seed: body.seed || `ac-clothing-${Math.floor(Math.random() * 6)}`,
     createdAt: new Date().toISOString(),
   };
@@ -80,13 +115,13 @@ app.patch("/api/admin/products/:id", requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
 
-  const allowed = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "rating", "reviews", "seed"];
   const update = {};
-  for (const key of allowed) {
+  for (const key of PRODUCT_FIELDS) {
     if (key in body) update[key] = body[key];
   }
   if (update.stock !== undefined) update.stock = Math.max(0, Math.floor(Number(update.stock) || 0));
   if (update.price !== undefined) update.price = Number(update.price);
+  if (update.isFeatured !== undefined) update.isFeatured = update.isFeatured === true;
   if (Object.keys(update).length === 0) return c.json({ error: "No valid fields to update" }, 400);
 
   try {
@@ -102,20 +137,103 @@ app.delete("/api/admin/products/:id", requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------- cloudinary signed upload ----------
+// ---------- cloudinary signed uploads ----------
+// Product photos & the homepage hero image are admin-only. Profile photos can
+// be uploaded by any signed-in user, but only into their own folder.
 
 app.post("/api/admin/cloudinary-signature", requireAdmin, async (c) => {
-  const sig = await buildCloudinarySignature(c.env);
+  const body = await c.req.json().catch(() => ({}));
+  const context = body?.context === "site" ? "site" : "product";
+  const baseFolder = c.env.CLOUDINARY_FOLDER || "artcanvas/products";
+  const folder = context === "site" ? baseFolder.replace(/\/products$/, "") + "/site" : baseFolder;
+  const sig = await buildCloudinarySignature(c.env, folder);
   return c.json(sig);
 });
 
-// ---------- orders / purchase history ----------
+app.post("/api/cloudinary-signature", requireAuth, async (c) => {
+  const user = c.get("user");
+  const baseFolder = (c.env.CLOUDINARY_FOLDER || "artcanvas/products").replace(/\/products$/, "");
+  const folder = `${baseFolder}/profiles/${user.uid}`;
+  const sig = await buildCloudinarySignature(c.env, folder);
+  return c.json(sig);
+});
+
+// ---------- site content (admin-controlled homepage) ----------
+
+app.get("/api/site-content", async (c) => {
+  const doc = await fsGet(c.env, "siteContent/home");
+  return c.json({
+    heroImage: doc?.heroImage || "",
+    heroHeadline: doc?.heroHeadline || "",
+    heroTagline: doc?.heroTagline || "",
+  });
+});
+
+app.patch("/api/admin/site-content", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
+  const update = {};
+  for (const key of ["heroImage", "heroHeadline", "heroTagline"]) {
+    if (key in body) update[key] = String(body[key] || "").slice(0, 2000);
+  }
+  const existing = await fsGet(c.env, "siteContent/home");
+  const saved = existing ? await fsPatch(c.env, "siteContent/home", update) : await fsCreate(c.env, "siteContent", update, "home");
+  return c.json(saved);
+});
+
+// ---------- user profile ----------
+
+function publicUser(claims, profile) {
+  return {
+    uid: claims.uid,
+    email: claims.email,
+    admin: !!claims.admin,
+    name: profile?.name || claims.name || "",
+    phone: profile?.phone || "",
+    photoURL: profile?.photoURL || "",
+    address: profile?.address || null,
+  };
+}
+
+app.get("/api/me", requireAuth, async (c) => {
+  const user = c.get("user");
+  const profile = await fsGet(c.env, `users/${user.uid}`);
+  return c.json(publicUser(user, profile));
+});
+
+app.patch("/api/me", requireAuth, async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
+
+  const update = {};
+  if (typeof body.name === "string") update.name = body.name.trim().slice(0, 120);
+  if (typeof body.phone === "string") update.phone = body.phone.trim().slice(0, 40);
+  if (typeof body.photoURL === "string") update.photoURL = body.photoURL.slice(0, 1000);
+  if (body.address !== undefined) update.address = cleanAddress(body.address);
+
+  const existing = await fsGet(c.env, `users/${user.uid}`);
+  const saved = existing ? await fsPatch(c.env, `users/${user.uid}`, update) : await fsCreate(c.env, "users", { email: user.email || "", ...update }, user.uid);
+  return c.json(publicUser(user, saved));
+});
+
+// ---------- orders / checkout / purchase history ----------
 
 app.post("/api/orders", requireAuth, async (c) => {
   const user = c.get("user");
   const body = await c.req.json().catch(() => null);
   const items = body?.items;
   if (!Array.isArray(items) || items.length === 0) return c.json({ error: "items[] required" }, 400);
+
+  const shipping = cleanAddress(body.shipping);
+  if (!shipping || !shipping.fullName || !shipping.phone || !shipping.line1 || !shipping.city) {
+    return c.json({ error: "Shipping details (name, phone, address, city) are required" }, 400);
+  }
+  const paymentMethod = ["cod", "bkash", "nagad"].includes(body.paymentMethod) ? body.paymentMethod : "cod";
+  const paymentRef = paymentMethod !== "cod" && typeof body.paymentRef === "string" ? body.paymentRef.trim().slice(0, 60) : "";
+  if (paymentMethod !== "cod" && !paymentRef) {
+    return c.json({ error: `Please provide the ${paymentMethod === "bkash" ? "bKash" : "Nagad"} transaction ID` }, 400);
+  }
 
   // Validate stock and build an order snapshot. Retry a couple of times if a
   // concurrent purchase raced us on the same product (optimistic concurrency
@@ -153,7 +271,9 @@ app.post("/api/orders", requireAuth, async (c) => {
     total,
     status: "placed",
     createdAt: new Date().toISOString(),
-    shipping: body.shipping || null,
+    shipping,
+    paymentMethod,
+    paymentRef,
   });
 
   return c.json(order, 201);
@@ -170,13 +290,6 @@ app.get("/api/admin/orders", requireAdmin, async (c) => {
   const all = await fsList(c.env, "orders");
   all.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return c.json(all);
-});
-
-// ---------- current user ----------
-
-app.get("/api/me", requireAuth, async (c) => {
-  const user = c.get("user");
-  return c.json({ uid: user.uid, email: user.email, name: user.name || null, admin: !!user.admin });
 });
 
 app.onError((err, c) => {

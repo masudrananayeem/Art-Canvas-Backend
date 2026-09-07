@@ -9,10 +9,15 @@ async function sha1Hex(message) {
   return [...new Uint8Array(hashBuffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export async function buildCloudinarySignature(env, extraParams = {}) {
+export async function buildCloudinarySignature(env, folderOverride) {
+  if (!env.CLOUDINARY_API_SECRET || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_CLOUD_NAME) {
+    throw new Error(
+      "Missing Cloudinary config. Set CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET (in .dev.vars for local dev, or via `wrangler secret put` for production) and CLOUDINARY_CLOUD_NAME in wrangler.toml [vars]."
+    );
+  }
   const timestamp = Math.floor(Date.now() / 1000);
-  const folder = env.CLOUDINARY_FOLDER || "artcanvas/products";
-  const params = { timestamp, folder, ...extraParams };
+  const folder = folderOverride || env.CLOUDINARY_FOLDER || "artcanvas/products";
+  const params = { timestamp, folder };
 
   const toSign = Object.keys(params)
     .sort()

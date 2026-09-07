@@ -24,7 +24,13 @@ async function getAccessToken(env) {
   if (cachedToken && cachedToken.exp - 60 > Date.now() / 1000) return cachedToken.token;
 
   const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-  const privateKeyPem = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const privateKeyRaw = env.FIREBASE_PRIVATE_KEY;
+  if (!clientEmail || !privateKeyRaw) {
+    throw new Error(
+      "Missing FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY. For local dev, create a `.dev.vars` file in Art-Canvas-backend (copy .dev.vars.example) and restart `wrangler dev`. For production, set them with `wrangler secret put`."
+    );
+  }
+  const privateKeyPem = privateKeyRaw.replace(/\\n/g, "\n");
 
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };

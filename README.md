@@ -87,6 +87,44 @@ npm run deploy
 Wrangler prints your live URL, e.g. `https://art-canvas-backend.<you>.workers.dev`.
 Put that URL in the frontend's `VITE_API_BASE_URL` env var.
 
+## Troubleshooting
+
+**`Cannot read properties of undefined (reading 'replace')` / 500 on `/api/products`**
+This means the Worker can't see `FIREBASE_PRIVATE_KEY` (and usually
+`FIREBASE_CLIENT_EMAIL`). Almost always the cause is one of:
+1. There's no `.dev.vars` file yet — run `cp .dev.vars.example .dev.vars`
+   inside `Art-Canvas-backend`, then **fill in the real values**.
+2. The file is misnamed (must be exactly `.dev.vars`, not
+   `.dev.vars.example` or `.dev.vars.txt`) and must sit in the
+   `Art-Canvas-backend` root, next to `wrangler.toml`.
+3. `wrangler dev` was already running when you created/edited `.dev.vars`
+   — stop it (Ctrl+C) and start it again; env vars are only loaded at
+   startup.
+
+You can sanity-check what the Worker sees (without exposing secret
+values) by opening `http://localhost:8787/` — it reports which vars it
+detected as `true`/`false`.
+
+**Deployed on Cloudflare but getting the same error**
+Production Workers don't read `.dev.vars` — you must set each secret with
+`wrangler secret put NAME` (see step 6 above) and then `npm run deploy`
+again.
+
+**CORS errors in the browser console**
+Make sure your frontend's actual origin (e.g.
+`http://localhost:5173` or your Pages URL) is listed in
+`ALLOWED_ORIGINS` in `wrangler.toml`, then restart/redeploy the Worker.
+
+## About payments
+
+Checkout collects a shipping address and a payment method: **Cash on
+Delivery**, or **bKash / Nagad** (the customer enters the transaction ID
+from their manual send-money, which you verify yourself before shipping).
+This backend does not process card payments — wiring up a real card
+gateway (Stripe, SSLCommerz, etc.) needs your own merchant account and API
+keys, which weren't part of this build. If you want that added later, the
+order-creation endpoint (`POST /api/orders`) is the place to plug it in.
+
 ## API reference
 
 | Method | Path | Auth | Description |
@@ -94,11 +132,15 @@ Put that URL in the frontend's `VITE_API_BASE_URL` env var.
 | GET | `/api/products` | public | List products (stock hidden, `inStock` boolean instead) |
 | GET | `/api/products/:id` | public | One product |
 | GET | `/api/admin/products` | admin | List products with real stock counts |
-| POST | `/api/admin/products` | admin | Create a product |
-| PATCH | `/api/admin/products/:id` | admin | Update a product (price, stock, category, image, ...) |
+| POST | `/api/admin/products` | admin | Create a product (`isFeatured` puts it on the homepage rail) |
+| PATCH | `/api/admin/products/:id` | admin | Update a product (price, stock, category, image, featured, ...) |
 | DELETE | `/api/admin/products/:id` | admin | Delete a product |
-| POST | `/api/admin/cloudinary-signature` | admin | Get a signed Cloudinary upload payload |
-| POST | `/api/orders` | user | Place an order: `{ items: [{id, qty}], shipping? }`. Decrements stock. |
+| POST | `/api/admin/cloudinary-signature` | admin | Signed upload for a product photo (`{context:"product"}`) or the homepage hero image (`{context:"site"}`) |
+| POST | `/api/cloudinary-signature` | user | Signed upload for the current user's own profile photo |
+| GET | `/api/site-content` | public | Homepage hero image/headline/tagline |
+| PATCH | `/api/admin/site-content` | admin | Update the homepage hero image/headline/tagline |
+| GET | `/api/me` | user | Current user's profile (name, phone, address, photo, admin flag) |
+| PATCH | `/api/me` | user | Update the current user's own profile |
+| POST | `/api/orders` | user | Place an order: `{ items: [{id, qty}], shipping: {fullName, phone, line1, line2?, city, state?, zip?, country?}, paymentMethod: "cod"\|"bkash"\|"nagad", paymentRef? }`. Validates & decrements real stock. |
 | GET | `/api/orders/me` | user | Current user's purchase history |
 | GET | `/api/admin/orders` | admin | All orders |
-| GET | `/api/me` | user | Current user's profile + admin flag |
