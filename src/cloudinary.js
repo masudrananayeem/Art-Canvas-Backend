@@ -10,9 +10,9 @@ async function sha1Hex(message) {
 }
 
 export async function buildCloudinarySignature(env, folderOverride) {
-  if (!env.CLOUDINARY_API_SECRET || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_CLOUD_NAME) {
+  if (!env.CLOUDINARY_API_SECRET || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_CLOUD_NAME || env.CLOUDINARY_CLOUD_NAME === "your-cloudinary-cloud-name") {
     throw new Error(
-      "Missing Cloudinary config. Set CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET (in .dev.vars for local dev, or via `wrangler secret put` for production) and CLOUDINARY_CLOUD_NAME in wrangler.toml [vars]."
+      "Missing/placeholder Cloudinary config. Set CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET (in .dev.vars for local dev, or via `wrangler secret put` for production) and set CLOUDINARY_CLOUD_NAME in wrangler.toml [vars] to your real cloud name."
     );
   }
   const timestamp = Math.floor(Date.now() / 1000);

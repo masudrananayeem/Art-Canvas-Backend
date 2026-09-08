@@ -97,6 +97,11 @@ function extractSpki(certDer) {
  * custom claim, etc.) or throws if invalid/expired.
  */
 export async function verifyIdToken(idToken, projectId) {
+  if (!projectId || projectId === "your-firebase-project-id") {
+    throw new Error(
+      'FIREBASE_PROJECT_ID is not set in wrangler.toml (still the placeholder). Set it under [vars] to your real Firebase project ID and restart `wrangler dev`.'
+    );
+  }
   const parts = idToken.split(".");
   if (parts.length !== 3) throw new Error("Malformed token");
   const [headerB64, payloadB64, sigB64] = parts;

@@ -66,6 +66,11 @@ async function getAccessToken(env) {
 }
 
 function baseUrl(env) {
+  if (!env.FIREBASE_PROJECT_ID || env.FIREBASE_PROJECT_ID === "your-firebase-project-id") {
+    throw new Error(
+      'FIREBASE_PROJECT_ID is not set (it\'s still the placeholder "your-firebase-project-id"). Open wrangler.toml and set it under [vars] to your real Firebase project ID, then restart `wrangler dev`. For production, redeploy after changing wrangler.toml.'
+    );
+  }
   return `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 }
 

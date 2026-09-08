@@ -62,6 +62,16 @@ const BUILTIN_CATEGORIES = [
 ];
 const BUILTIN_CATEGORY_IDS = new Set(BUILTIN_CATEGORIES.map((c) => c.id));
 
+// Clothing's built-in Women/Men/Kids sub-categories. Same deal as
+// categories: these always show up and can't be deleted, admins can add
+// more or remove the ones they added.
+const BUILTIN_SUBCATEGORIES = {
+  women: ["Dresses", "Outerwear", "Tops"],
+  men: ["Shirts", "Outerwear", "Trousers"],
+  kids: ["Tees", "Outerwear", "Sets"],
+};
+const SUBCATEGORY_GENDERS = new Set(Object.keys(BUILTIN_SUBCATEGORIES));
+
 function slugify(name) {
   return name
     .toLowerCase()
@@ -196,6 +206,65 @@ app.delete("/api/admin/categories/:id", requireAdmin, async (c) => {
   }
 
   await fsDelete(c.env, `categories/${id}`);
+  return c.json({ ok: true });
+});
+
+// ---------- clothing sub-categories (Women / Men / Kids) ----------
+
+app.get("/api/subcategories", async (c) => {
+  const custom = await fsList(c.env, "subcategories"); // docs: {id: gender, items: [names]}
+  const byGender = Object.fromEntries(custom.map((d) => [d.id, d.items || []]));
+  const result = {};
+  for (const gender of Object.keys(BUILTIN_SUBCATEGORIES)) {
+    result[gender] = [
+      ...BUILTIN_SUBCATEGORIES[gender].map((name) => ({ name, builtin: true })),
+      ...(byGender[gender] || []).map((name) => ({ name, builtin: false })),
+    ];
+  }
+  return c.json(result);
+});
+
+app.post("/api/admin/subcategories", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const gender = body?.gender;
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!SUBCATEGORY_GENDERS.has(gender)) return c.json({ error: "gender must be one of women, men, kids" }, 400);
+  if (!name) return c.json({ error: "Sub-category name is required" }, 400);
+
+  const existingNames = [...BUILTIN_SUBCATEGORIES[gender]];
+  const doc = await fsGet(c.env, `subcategories/${gender}`);
+  const items = doc?.items || [];
+  existingNames.push(...items);
+  if (existingNames.some((n) => n.toLowerCase() === name.toLowerCase())) {
+    return c.json({ error: `"${name}" already exists under ${gender}` }, 409);
+  }
+
+  const nextItems = [...items, name];
+  const saved = doc ? await fsPatch(c.env, `subcategories/${gender}`, { items: nextItems }) : await fsCreate(c.env, "subcategories", { items: nextItems }, gender);
+  return c.json({ gender, items: saved.items }, 201);
+});
+
+app.delete("/api/admin/subcategories", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const gender = body?.gender;
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!SUBCATEGORY_GENDERS.has(gender)) return c.json({ error: "gender must be one of women, men, kids" }, 400);
+  if (BUILTIN_SUBCATEGORIES[gender]?.some((n) => n.toLowerCase() === name.toLowerCase())) {
+    return c.json({ error: "Default sub-categories can't be deleted" }, 400);
+  }
+
+  const doc = await fsGet(c.env, `subcategories/${gender}`);
+  const items = doc?.items || [];
+  if (!items.some((n) => n.toLowerCase() === name.toLowerCase())) return c.json({ error: "Sub-category not found" }, 404);
+
+  const products = await fsList(c.env, "products");
+  const inUse = products.filter((p) => p.category === "clothing" && p.gender === gender && p.subcategory === name).length;
+  if (inUse > 0) {
+    return c.json({ error: `${inUse} product${inUse === 1 ? "" : "s"} still use this sub-category. Move or delete ${inUse === 1 ? "it" : "them"} first.` }, 409);
+  }
+
+  const nextItems = items.filter((n) => n.toLowerCase() !== name.toLowerCase());
+  await fsPatch(c.env, `subcategories/${gender}`, { items: nextItems });
   return c.json({ ok: true });
 });
 

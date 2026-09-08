@@ -89,6 +89,16 @@ Put that URL in the frontend's `VITE_API_BASE_URL` env var.
 
 ## Troubleshooting
 
+**`Cloud Firestore API has not been used in project your-firebase-project-id...` / `FIREBASE_PROJECT_ID is not set...`**
+This means `wrangler.toml` still has the placeholder project ID. This
+happens most often when you replace this whole folder with a newer version
+of the code — `wrangler.toml` gets reset to its defaults, wiping out the
+real project ID/Cloudinary cloud name you had set before. **Every time you
+replace this folder, re-open `wrangler.toml` and re-enter your real
+`FIREBASE_PROJECT_ID`, `CLOUDINARY_CLOUD_NAME`, and `ALLOWED_ORIGINS`
+under `[vars]`, then restart `wrangler dev`.** (`.dev.vars` isn't affected
+by this — only `wrangler.toml`.)
+
 **`Cannot read properties of undefined (reading 'replace')` / 500 on `/api/products`**
 This means the Worker can't see `FIREBASE_PRIVATE_KEY` (and usually
 `FIREBASE_CLIENT_EMAIL`). Almost always the cause is one of:
@@ -134,6 +144,9 @@ order-creation endpoint (`POST /api/orders`) is the place to plug it in.
 | GET | `/api/categories` | public | List all categories (5 built-in + any admin-added ones) |
 | POST | `/api/admin/categories` | admin | Add a new category (`{name}` — id is auto-slugged from the name) |
 | DELETE | `/api/admin/categories/:id` | admin | Delete a category. Built-in categories can't be deleted; a custom one can't be deleted while products still use it |
+| GET | `/api/subcategories` | public | List Women/Men/Kids clothing sub-categories (built-in + admin-added) |
+| POST | `/api/admin/subcategories` | admin | Add a sub-category (`{gender, name}`, gender is `women`/`men`/`kids`) |
+| DELETE | `/api/admin/subcategories` | admin | Remove a sub-category (`{gender, name}`). Built-in ones can't be removed; a custom one can't be removed while products still use it |
 | GET | `/api/admin/products` | admin | List products with real stock counts |
 | POST | `/api/admin/products` | admin | Create a product (`isFeatured` puts it on the homepage rail) |
 | PATCH | `/api/admin/products/:id` | admin | Update a product (price, stock, category, image, featured, ...) |
