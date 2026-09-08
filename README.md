@@ -131,6 +131,9 @@ order-creation endpoint (`POST /api/orders`) is the place to plug it in.
 |---|---|---|---|
 | GET | `/api/products` | public | List products (stock hidden, `inStock` boolean instead) |
 | GET | `/api/products/:id` | public | One product |
+| GET | `/api/categories` | public | List all categories (5 built-in + any admin-added ones) |
+| POST | `/api/admin/categories` | admin | Add a new category (`{name}` — id is auto-slugged from the name) |
+| DELETE | `/api/admin/categories/:id` | admin | Delete a category. Built-in categories can't be deleted; a custom one can't be deleted while products still use it |
 | GET | `/api/admin/products` | admin | List products with real stock counts |
 | POST | `/api/admin/products` | admin | Create a product (`isFeatured` puts it on the homepage rail) |
 | PATCH | `/api/admin/products/:id` | admin | Update a product (price, stock, category, image, featured, ...) |

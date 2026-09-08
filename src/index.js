@@ -50,6 +50,27 @@ function isValidProductInput(body) {
 
 const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "rating", "reviews", "seed", "isFeatured"];
 
+// The five categories the store ships with. They always appear in
+// GET /api/categories and can't be deleted — admins can only add to this
+// list or remove the custom ones they created.
+const BUILTIN_CATEGORIES = [
+  { id: "clothing", name: "Clothing" },
+  { id: "art", name: "Art" },
+  { id: "objects", name: "Objects" },
+  { id: "accessories", name: "Accessories" },
+  { id: "gifts", name: "Gifts" },
+];
+const BUILTIN_CATEGORY_IDS = new Set(BUILTIN_CATEGORIES.map((c) => c.id));
+
+function slugify(name) {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+}
+
 function cleanAddress(a) {
   if (!a || typeof a !== "object") return null;
   const pick = (k) => (typeof a[k] === "string" ? a[k].trim().slice(0, 200) : "");
@@ -134,6 +155,47 @@ app.patch("/api/admin/products/:id", requireAdmin, async (c) => {
 
 app.delete("/api/admin/products/:id", requireAdmin, async (c) => {
   await fsDelete(c.env, `products/${c.req.param("id")}`);
+  return c.json({ ok: true });
+});
+
+// ---------- categories ----------
+
+app.get("/api/categories", async (c) => {
+  const custom = await fsList(c.env, "categories");
+  const all = [...BUILTIN_CATEGORIES.map((cat) => ({ ...cat, builtin: true })), ...custom.map((cat) => ({ id: cat.id, name: cat.name, builtin: false }))];
+  return c.json(all);
+});
+
+app.post("/api/admin/categories", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const name = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!name) return c.json({ error: "Category name is required" }, 400);
+
+  const id = slugify(name);
+  if (!id) return c.json({ error: "Please use a name with at least one letter or number" }, 400);
+  if (BUILTIN_CATEGORY_IDS.has(id)) return c.json({ error: `"${name}" is already a default category` }, 409);
+
+  const existing = await fsGet(c.env, `categories/${id}`);
+  if (existing) return c.json({ error: `A category named "${existing.name}" already exists` }, 409);
+
+  const created = await fsCreate(c.env, "categories", { name, createdAt: new Date().toISOString() }, id);
+  return c.json({ id: created.id, name: created.name, builtin: false }, 201);
+});
+
+app.delete("/api/admin/categories/:id", requireAdmin, async (c) => {
+  const id = c.req.param("id");
+  if (BUILTIN_CATEGORY_IDS.has(id)) return c.json({ error: "Default categories can't be deleted" }, 400);
+
+  const existing = await fsGet(c.env, `categories/${id}`);
+  if (!existing) return c.json({ error: "Category not found" }, 404);
+
+  const products = await fsList(c.env, "products");
+  const inUse = products.filter((p) => p.category === id).length;
+  if (inUse > 0) {
+    return c.json({ error: `${inUse} product${inUse === 1 ? "" : "s"} still use this category. Move or delete ${inUse === 1 ? "it" : "them"} first.` }, 409);
+  }
+
+  await fsDelete(c.env, `categories/${id}`);
   return c.json({ ok: true });
 });
 
