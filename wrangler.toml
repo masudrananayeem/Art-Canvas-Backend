@@ -8,5 +8,5 @@ compatibility_date = "2024-11-01"
 [vars]
 FIREBASE_PROJECT_ID = "your-firebase-project-id"
 ALLOWED_ORIGINS = "https://art-canvas-frontend.pages.dev,http://localhost:5173"
-CLOUDINARY_CLOUD_NAME = "your-cloudinary-cloud-name"
+CLOUDINARY_CLOUD_NAME =z9s3in7s
 CLOUDINARY_FOLDER = "artcanvas/products"
