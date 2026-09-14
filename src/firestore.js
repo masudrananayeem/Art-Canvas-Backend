@@ -184,6 +184,69 @@ export async function fsPatch(env, path, data, expectedUpdateTime) {
   return { id: idFromName(doc.name), updateTime: doc.updateTime, ...fromFirestoreDoc(doc) };
 }
 
+
+// Run a Firestore REST transaction. The callback receives a transaction id and
+// can read documents inside that transaction. Writes are committed atomically.
+// This is used by checkout so stock reservation cannot fail because of a stale
+// updateTime/precondition (the previous approach could surface HTTP 409).
+export async function fsRunTransaction(env, callback, maxAttempts = 5) {
+  const token = await getAccessToken(env);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const begin = await fetch(`${baseUrl(env)}:beginTransaction`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ options: { readWrite: {} } }),
+    });
+    if (!begin.ok) throw new Error(`Firestore BEGIN TRANSACTION failed: ${await begin.text()}`);
+    const { transaction } = await begin.json();
+
+    const txGet = async (path) => {
+      const url = new URL(`${baseUrl(env)}/${path}`);
+      url.searchParams.set("transaction", transaction);
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.status === 404) return null;
+      if (!res.ok) {
+        const err = new Error(`Firestore TX GET ${path} failed: ${await res.text()}`);
+        err.status = res.status;
+        throw err;
+      }
+      const doc = await res.json();
+      return { id: idFromName(doc.name), updateTime: doc.updateTime, resourceName: doc.name, ...fromFirestoreDoc(doc) };
+    };
+
+    try {
+      const result = await callback({ transaction, get: txGet });
+      const writes = Array.isArray(result?.writes) ? result.writes : [];
+      const commit = await fetch(`${baseUrl(env)}:commit`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ transaction, writes }),
+      });
+      if (commit.ok) return result?.value;
+      const text = await commit.text();
+      const err = new Error(`Firestore COMMIT failed: ${text}`);
+      err.status = commit.status;
+      // Firestore may return 409 ABORTED when another checkout touches the
+      // same product concurrently. Restarting the whole transaction is safe.
+      if (commit.status === 409 || /ABORTED|transaction.*abort/i.test(text)) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    } catch (e) {
+      if (e?.status === 409 || /ABORTED|transaction.*abort/i.test(String(e?.message || ""))) {
+        lastError = e;
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  throw lastError || new Error("Could not complete Firestore transaction");
+}
+
 export async function fsDelete(env, path) {
   const token = await getAccessToken(env);
   const res = await fetch(`${baseUrl(env)}/${path}`, {

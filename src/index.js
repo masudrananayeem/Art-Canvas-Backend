@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { requireAuth, requireAdmin } from "./auth.js";
-import { fsGet, fsList, fsCreate, fsPatch, fsDelete, fsQueryEquals } from "./firestore.js";
+import { fsGet, fsList, fsCreate, fsPatch, fsDelete, fsQueryEquals, fsRunTransaction } from "./firestore.js";
 import { buildCloudinarySignature } from "./cloudinary.js";
 
 const app = new Hono();
@@ -504,63 +504,126 @@ app.patch("/api/me", requireAuth, async (c) => {
 app.post("/api/orders", requireAuth, async (c) => {
   const user = c.get("user");
   const body = await c.req.json().catch(() => null);
-  const items = body?.items;
-  if (!Array.isArray(items) || items.length === 0) return c.json({ error: "items[] required" }, 400);
+  const items = Array.isArray(body?.items) ? body.items : [];
+  if (items.length === 0) return c.json({ error: "items[] required" }, 400);
 
   const shipping = cleanAddress(body.shipping);
   if (!shipping || !shipping.fullName || !shipping.phone || !shipping.line1 || !shipping.city) {
     return c.json({ error: "Shipping details (name, phone, address, city) are required" }, 400);
   }
+
   const paymentMethod = ["cod", "bkash", "nagad"].includes(body.paymentMethod) ? body.paymentMethod : "cod";
-  const paymentRef = paymentMethod !== "cod" && typeof body.paymentRef === "string" ? body.paymentRef.trim().slice(0, 60) : "";
+  const paymentRef = paymentMethod !== "cod" && typeof body.paymentRef === "string"
+    ? body.paymentRef.trim().slice(0, 60)
+    : "";
   if (paymentMethod !== "cod" && !paymentRef) {
     return c.json({ error: `Please provide the ${paymentMethod === "bkash" ? "bKash" : "Nagad"} transaction ID` }, 400);
   }
 
-  // Validate stock and build an order snapshot. Retry a couple of times if a
-  // concurrent purchase raced us on the same product (optimistic concurrency
-  // via Firestore's updateTime precondition).
-  const orderItems = [];
-  let total = 0;
-
+  // Consolidate duplicate cart lines first. This prevents reserving the same
+  // product twice in one checkout and makes the transaction deterministic.
+  const quantities = new Map();
   for (const line of items) {
-    const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
-    let attempt = 0;
-    let done = false;
-    while (attempt < 3 && !done) {
-      attempt++;
-      const product = await fsGet(c.env, `products/${line.id}`);
-      if (!product) return c.json({ error: `Product ${line.id} not found` }, 404);
-      const currentStock = product.stock ?? 0;
-      const currentSold = Number.isFinite(product.sold) ? product.sold : 0;
-      if (currentStock < qty) return c.json({ error: `"${product.name}" is out of stock` }, 409);
-      try {
-        await fsPatch(c.env, `products/${line.id}`, { stock: currentStock - qty, sold: currentSold + qty }, product.updateTime);
-        orderItems.push({ id: product.id, name: product.name, price: product.price, image: product.image || "", qty });
-        total += product.price * qty;
-        done = true;
-      } catch (e) {
-        if (e.status === 400 || e.status === 409) continue; // precondition failed, retry
-        throw e;
-      }
-    }
-    if (!done) return c.json({ error: "Could not reserve stock, please try again" }, 409);
+    const id = String(line?.id || "").trim();
+    const qty = Math.max(1, Math.floor(Number(line?.qty) || 1));
+    if (!id) return c.json({ error: "Invalid product in cart" }, 400);
+    quantities.set(id, (quantities.get(id) || 0) + qty);
   }
 
-  const order = await fsCreate(c.env, "orders", {
-    uid: user.uid,
-    email: user.email || "",
-    items: orderItems,
-    total,
-    status: "placed",
-    createdAt: new Date().toISOString(),
-    shipping,
-    paymentMethod,
-    paymentRef,
-  });
+  try {
+    const now = new Date().toISOString();
+    const orderId = crypto.randomUUID();
+    const result = await fsRunTransaction(c.env, async ({ transaction, get }) => {
+      const orderItems = [];
+      const stockWrites = [];
+      let total = 0;
 
-  return c.json(order, 201);
+      for (const [id, qty] of quantities) {
+        const product = await get(`products/${id}`);
+        if (!product) throw Object.assign(new Error(`Product ${id} not found`), { status: 404 });
+
+        const currentStock = Math.max(0, Math.floor(Number(product.stock) || 0));
+        const currentSold = Number.isFinite(product.sold) ? product.sold : 0;
+        const price = Number(product.price);
+        if (!Number.isFinite(price) || price < 0) {
+          throw Object.assign(new Error(`Product "${product.name}" has an invalid price`), { status: 400 });
+        }
+        if (currentStock < qty) {
+          throw Object.assign(new Error(`"${product.name}" is out of stock. Available: ${currentStock}`), { status: 409 });
+        }
+
+        stockWrites.push({
+          update: {
+            name: product.name ? `${product.name}` : `products/${id}`,
+            fields: {},
+          },
+        });
+        // Firestore document names must be full resource names. The tx GET
+        // helper exposes the exact name so renamed/project-specific paths are safe.
+        stockWrites[stockWrites.length - 1].update.name = product.resourceName || `projects/${c.env.FIREBASE_PROJECT_ID}/databases/(default)/documents/products/${id}`;
+        stockWrites[stockWrites.length - 1].update.fields = {
+          stock: { integerValue: String(currentStock - qty) },
+          sold: { doubleValue: currentSold + qty },
+        };
+        stockWrites[stockWrites.length - 1].updateMask = { fieldPaths: ["stock", "sold"] };
+
+        orderItems.push({ id: product.id, name: product.name, price, image: product.image || "", qty });
+        total += price * qty;
+      }
+
+      const orderData = {
+        uid: user.uid,
+        email: user.email || "",
+        customerName: shipping.fullName,
+        phone: shipping.phone,
+        items: orderItems,
+        total,
+        status: "placed",
+        statusHistory: [{ status: "placed", at: now }],
+        createdAt: now,
+        shipping,
+        paymentMethod,
+        paymentRef,
+      };
+
+      const orderName = `projects/${c.env.FIREBASE_PROJECT_ID}/databases/(default)/documents/orders/${orderId}`;
+      stockWrites.push({
+        update: { name: orderName, fields: toFirestoreFieldsForOrder(orderData) },
+        currentDocument: { exists: false },
+      });
+
+      return { writes: stockWrites, value: { id: orderId, ...orderData } };
+    });
+
+    // Return the exact order document after the atomic transaction.
+    const saved = await fsGet(c.env, `orders/${result.id}`);
+    return c.json(saved || result, 201);
+  } catch (e) {
+    const status = Number.isInteger(e?.status) ? e.status : 500;
+    return c.json({ error: e?.message || "Could not place order" }, status);
+  }
 });
+
+// Keep the checkout route independent from Firestore's private encoder.
+// The transaction helper expects already-encoded Firestore fields.
+function toFirestoreFieldsForOrder(obj) {
+  const encode = (v) => {
+    if (v === null || v === undefined) return { nullValue: null };
+    if (typeof v === "boolean") return { booleanValue: v };
+    if (typeof v === "number") return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+    if (typeof v === "string") return { stringValue: v };
+    if (Array.isArray(v)) return { arrayValue: { values: v.map(encode) } };
+    if (typeof v === "object") {
+      const fields = {};
+      for (const [k, value] of Object.entries(v)) fields[k] = encode(value);
+      return { mapValue: { fields } };
+    }
+    return { stringValue: String(v) };
+  };
+  const fields = {};
+  for (const [k, v] of Object.entries(obj)) fields[k] = encode(v);
+  return fields;
+}
 
 app.get("/api/orders/me", requireAuth, async (c) => {
   const user = c.get("user");
@@ -613,9 +676,13 @@ app.patch("/api/admin/orders/:id", requireAdmin, async (c) => {
     }
   }
 
+  const now = new Date().toISOString();
+  const history = Array.isArray(order.statusHistory) ? order.statusHistory : [{ status: order.status, at: order.createdAt || now }];
+  const nextHistory = history.length && history[history.length - 1]?.status === status ? history : [...history, { status, at: now }];
   const saved = await fsPatch(c.env, `orders/${id}`, {
     status,
-    updatedAt: new Date().toISOString(),
+    statusHistory: nextHistory,
+    updatedAt: now,
   });
   return c.json(saved);
 });
