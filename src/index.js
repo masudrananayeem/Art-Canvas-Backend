@@ -48,7 +48,7 @@ function isValidProductInput(body) {
   return body && typeof body.name === "string" && body.name.trim().length > 0 && typeof body.price === "number" && body.price >= 0;
 }
 
-const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "rating", "reviews", "seed", "isFeatured", "sold"];
+const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "imagePublicIds", "rating", "reviews", "seed", "isFeatured", "sold"];
 
 // The five categories the store ships with. They always appear in
 // GET /api/categories and can't be deleted — admins can only add to this
@@ -136,6 +136,8 @@ app.post("/api/admin/products", requireAdmin, async (c) => {
     stock: Number.isFinite(body.stock) ? Math.max(0, Math.floor(body.stock)) : 0,
     image: body.image || "",
     imagePublicId: body.imagePublicId || "",
+    images: Array.isArray(body.images) ? body.images.filter((v) => typeof v === "string" && v.trim()).slice(0, 8) : (body.image ? [body.image] : []),
+    imagePublicIds: Array.isArray(body.imagePublicIds) ? body.imagePublicIds.filter((v) => typeof v === "string" && v.trim()).slice(0, 8) : (body.imagePublicId ? [body.imagePublicId] : []),
     rating: Number.isFinite(body.rating) ? body.rating : 4.8,
     reviews: Number.isFinite(body.reviews) ? body.reviews : 0,
     isFeatured: body.isFeatured === true,
@@ -432,7 +434,7 @@ app.post("/api/cloudinary-signature", requireAuth, async (c) => {
 // ---------- site content (admin-controlled homepage) ----------
 
 const SITE_CONTENT_DEFAULTS = {
-  heroImage: "", heroHeadline: "", heroTagline: "", heroTopLeft: "ARTCANVAS / NEW SEASON", heroTopRight: "DROP 04 — 2026",
+  heroImage: "", manifestoImage: "", heroHeadline: "", heroTagline: "", heroTopLeft: "ARTCANVAS / NEW SEASON", heroTopRight: "DROP 04 — 2026",
   heroCtaLabel: "Explore the collection", heroCtaLink: "/shop?category=clothing", heroCtaNote: "Designed in small runs.\nMade to be kept.",
   heroBottomLeft: "01", heroBottomRight: "EST. 2026", filmTitle: "Clothing in motion.", filmDescription: "A moving study of fabric, proportion and everyday gesture.", filmVideoUrl: "",
   showWhatsNew: true, showFilm: true, showManifesto: true, showAnnouncement: false, announcementText: "", featuredTitle: "Currently interesting.", featuredDescription: "", whatsNewTitle: "What’s new.", whatsNewDescription: "Fresh pieces, new proportions and objects worth noticing."
@@ -447,7 +449,7 @@ app.patch("/api/admin/site-content", requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
   const update = {};
-  const strings = ["heroImage","heroHeadline","heroTagline","heroTopLeft","heroTopRight","heroCtaLabel","heroCtaLink","heroCtaNote","heroBottomLeft","heroBottomRight","filmTitle","filmDescription","filmVideoUrl","announcementText","featuredTitle","featuredDescription","whatsNewTitle","whatsNewDescription"];
+  const strings = ["heroImage","manifestoImage","heroHeadline","heroTagline","heroTopLeft","heroTopRight","heroCtaLabel","heroCtaLink","heroCtaNote","heroBottomLeft","heroBottomRight","filmTitle","filmDescription","filmVideoUrl","announcementText","featuredTitle","featuredDescription","whatsNewTitle","whatsNewDescription"];
   for (const key of strings) if (key in body) update[key] = String(body[key] || "").slice(0, 2000);
   for (const key of ["showWhatsNew","showFilm","showManifesto","showAnnouncement"]) if (key in body) update[key] = body[key] === true;
   const existing = await fsGet(c.env, "siteContent/home");
