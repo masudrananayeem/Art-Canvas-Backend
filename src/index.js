@@ -37,6 +37,32 @@ app.get("/", (c) => {
   });
 });
 
+// Public newsletter subscription. Stores subscribers in Firestore so the footer
+// studio-letter form works in both local Wrangler and production deployments.
+app.post("/api/newsletter", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return c.json({ error: "Please enter a valid email address." }, 400);
+  }
+
+  // Use a deterministic document id so repeated subscriptions are idempotent
+  // and do not create duplicate subscriber records.
+  const docId = encodeURIComponent(email);
+  const existing = await fsGet(c.env, `newsletter/${docId}`);
+  if (existing) {
+    return c.json({ ok: true, subscribed: true, alreadySubscribed: true });
+  }
+
+  await fsCreate(c.env, "newsletter", {
+    email,
+    createdAt: new Date().toISOString(),
+    source: "studio-letter",
+  }, docId);
+
+  return c.json({ ok: true, subscribed: true, alreadySubscribed: false }, 201);
+});
+
 // ---------- helpers ----------
 
 function publicProduct(p) {
@@ -48,7 +74,16 @@ function isValidProductInput(body) {
   return body && typeof body.name === "string" && body.name.trim().length > 0 && typeof body.price === "number" && body.price >= 0;
 }
 
-const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "imagePublicIds", "rating", "reviews", "seed", "isFeatured", "sold"];
+function normalizeProductImages(body) {
+  const raw = Array.isArray(body?.images) ? body.images : [];
+  const urls = raw
+    .map((item) => typeof item === "string" ? item : item?.url)
+    .filter((url) => typeof url === "string" && /^https?:\/\//i.test(url));
+  if (typeof body?.image === "string" && body.image && !urls.includes(body.image)) urls.unshift(body.image);
+  return urls.slice(0, 8);
+}
+
+const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "rating", "reviews", "seed", "isFeatured", "sold"];
 
 // The five categories the store ships with. They always appear in
 // GET /api/categories and can't be deleted — admins can only add to this
@@ -134,10 +169,9 @@ app.post("/api/admin/products", requireAdmin, async (c) => {
     gender: body.gender || "all",
     subcategory: body.subcategory || "",
     stock: Number.isFinite(body.stock) ? Math.max(0, Math.floor(body.stock)) : 0,
-    image: body.image || "",
+    image: body.image || normalizeProductImages(body)[0] || "",
     imagePublicId: body.imagePublicId || "",
-    images: Array.isArray(body.images) ? body.images.filter((v) => typeof v === "string" && v.trim()).slice(0, 8) : (body.image ? [body.image] : []),
-    imagePublicIds: Array.isArray(body.imagePublicIds) ? body.imagePublicIds.filter((v) => typeof v === "string" && v.trim()).slice(0, 8) : (body.imagePublicId ? [body.imagePublicId] : []),
+    images: normalizeProductImages(body),
     rating: Number.isFinite(body.rating) ? body.rating : 4.8,
     reviews: Number.isFinite(body.reviews) ? body.reviews : 0,
     isFeatured: body.isFeatured === true,
@@ -161,6 +195,11 @@ app.patch("/api/admin/products/:id", requireAdmin, async (c) => {
   if (update.stock !== undefined) update.stock = Math.max(0, Math.floor(Number(update.stock) || 0));
   if (update.price !== undefined) update.price = Number(update.price);
   if (update.isFeatured !== undefined) update.isFeatured = update.isFeatured === true;
+  if (update.images !== undefined) {
+    const normalized = normalizeProductImages(update);
+    update.images = normalized;
+    if (normalized.length && !update.image) update.image = normalized[0];
+  }
   if (Object.keys(update).length === 0) return c.json({ error: "No valid fields to update" }, 400);
 
   try {
@@ -723,6 +762,7 @@ app.post("/api/messages", requireAuth, async (c) => {
     email: user.email || "",
     from: "user",
     text,
+    seenByAdmin: false,
     createdAt: new Date().toISOString(),
   });
   return c.json(message, 201);
@@ -759,10 +799,12 @@ app.get("/api/admin/messages/threads", requireAdmin, async (c) => {
         lastText: m.text || "",
         lastFrom: m.from || "user",
         lastAt: m.createdAt || "",
+        unreadCount: m.from === "user" && m.seenByAdmin !== true ? 1 : 0,
       });
     } else if (!existing.email && m.email) {
       existing.email = m.email;
     }
+    if (existing && m.from === "user" && m.seenByAdmin !== true) existing.unreadCount = (existing.unreadCount || 0) + 1;
   }
   const threads = [...byUid.values()].sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
   return c.json(threads);
@@ -788,6 +830,20 @@ app.get("/api/admin/messages/:uid", requireAdmin, async (c) => {
   const uid = c.req.param("uid");
   const thread = await fsQueryEquals(c.env, "messages", "uid", uid);
   return c.json(sortByCreatedAt(thread));
+});
+
+// Admin marks all customer messages in a thread as seen when opening it.
+app.patch("/api/admin/messages/:uid/read", requireAdmin, async (c) => {
+  const uid = c.req.param("uid");
+  const thread = await fsQueryEquals(c.env, "messages", "uid", uid);
+  let updated = 0;
+  for (const message of thread) {
+    if (message.from === "user" && message.seenByAdmin !== true && message.id) {
+      await fsPatch(c.env, `messages/${message.id}`, { seenByAdmin: true });
+      updated += 1;
+    }
+  }
+  return c.json({ ok: true, updated });
 });
 
 // Admin: reply into a specific client's conversation.
@@ -823,6 +879,7 @@ app.post("/api/admin/messages/:uid", requireAdmin, async (c) => {
     email,
     from: "admin",
     text,
+    seenByAdmin: true,
     createdAt: new Date().toISOString(),
   });
   return c.json(message, 201);
