@@ -133,11 +133,79 @@ export async function requireAuth(c, next) {
   if (!token) return c.json({ error: "Missing Authorization bearer token" }, 401);
   try {
     const user = await verifyIdToken(token, c.env.FIREBASE_PROJECT_ID);
-    c.set("user", user);
+    const adminRecord = await ensureLegacyAdminRecord(c.env, user);
+    const activeAdmin = adminRecord && !["suspended","deleted","inactive"].includes(adminRecord.status || "active");
+    c.set("user", { ...user, admin: !!user.admin || !!activeAdmin, adminRecord: activeAdmin ? adminRecord : null });
     await next();
   } catch (e) {
     return c.json({ error: "Invalid or expired token", detail: String(e.message || e) }, 401);
   }
+}
+
+async function getAdminRecord(env, uid) {
+  try {
+    const { fsGet } = await import("./firestore.js");
+    return await fsGet(env, `adminUsers/${uid}`);
+  } catch {
+    return null;
+  }
+}
+
+const ALL_ADMIN_PERMISSIONS = [
+  "viewDashboard",
+  "manageProducts",
+  "manageCategories",
+  "manageOrders",
+  "manageMessages",
+  "managePayments",
+  "manageHomepage",
+  "manageAdmins",
+  "viewAuditLogs",
+  "manageSettings",
+  "manageCirculation",
+  "manageMembership",
+  "manageContact",
+];
+
+const ROLE_DEFAULT_PERMISSIONS = {
+  Admin: new Set(ALL_ADMIN_PERMISSIONS),
+  Moderator: new Set(["viewDashboard","manageProducts","manageCategories","manageOrders","manageMessages","managePayments","manageHomepage","manageCirculation","manageMembership","manageContact"]),
+  Seller: new Set(["viewDashboard","manageProducts","manageOrders"]),
+};
+
+async function ensureLegacyAdminRecord(env, user) {
+  if (!user?.admin || !user?.uid) return null;
+  const existing = await getAdminRecord(env, user.uid);
+  if (existing) return existing;
+  try {
+    const { fsCreate } = await import("./firestore.js");
+    const permissions = Object.fromEntries(ALL_ADMIN_PERMISSIONS.map((p) => [p, true]));
+    return await fsCreate(env, "adminUsers", {
+      name: user.name || user.email || "ArtCanvas Admin",
+      email: user.email || "",
+      role: "Admin",
+      status: "active",
+      permissions,
+      createdAt: new Date().toISOString(),
+      createdBy: "firebase-custom-claim",
+    }, user.uid);
+  } catch {
+    return {
+      id: user.uid,
+      name: user.name || user.email || "ArtCanvas Admin",
+      email: user.email || "",
+      role: "Admin",
+      status: "active",
+      permissions: Object.fromEntries(ALL_ADMIN_PERMISSIONS.map((p) => [p, true])),
+    };
+  }
+}
+
+function permissionAllowed(adminRecord, permission) {
+  if (!adminRecord) return false;
+  if (adminRecord.role === "Admin") return true;
+  if (adminRecord.permissions && typeof adminRecord.permissions[permission] === "boolean") return adminRecord.permissions[permission];
+  return ROLE_DEFAULT_PERMISSIONS[adminRecord.role]?.has(permission) === true;
 }
 
 export async function requireAdmin(c, next) {
@@ -146,10 +214,64 @@ export async function requireAdmin(c, next) {
   if (!token) return c.json({ error: "Missing Authorization bearer token" }, 401);
   try {
     const user = await verifyIdToken(token, c.env.FIREBASE_PROJECT_ID);
-    if (!user.admin) return c.json({ error: "Admin access required" }, 403);
-    c.set("user", user);
+    const adminRecord = await ensureLegacyAdminRecord(c.env, user);
+    const active = adminRecord && !["suspended","deleted","inactive"].includes(adminRecord.status || "active");
+    if (!user.admin && !active) return c.json({ error: "Admin access required" }, 403);
+    c.set("user", { ...user, admin: true, adminRecord });
     await next();
   } catch (e) {
     return c.json({ error: "Invalid or expired token", detail: String(e.message || e) }, 401);
   }
+}
+
+export function requireAdminPermission(permission) {
+  return async (c, next) => {
+    const authHeader = c.req.header("Authorization") || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) return c.json({ error: "Missing Authorization bearer token" }, 401);
+    try {
+      const user = await verifyIdToken(token, c.env.FIREBASE_PROJECT_ID);
+      const adminRecord = await ensureLegacyAdminRecord(c.env, user);
+      const active = adminRecord && !["suspended","deleted","inactive"].includes(adminRecord.status || "active");
+      if (!active) {
+        // A custom-claim admin without a profile is migrated by
+        // ensureLegacyAdminRecord(). If a profile exists but is suspended,
+        // the profile status is authoritative and access must stop.
+        return c.json({ error: "Admin access required" }, 403);
+      }
+      // Owner-level Firebase custom-claim admins keep full access for backward
+      // compatibility. Once a role/permission profile exists, its restrictions
+      // are respected unless the profile itself is the Admin role.
+      if (!user.admin && !permissionAllowed(adminRecord, permission)) {
+        return c.json({ error: `Permission denied: ${permission}` }, 403);
+      }
+      if (user.admin && adminRecord.role !== "Admin" && !permissionAllowed(adminRecord, permission)) {
+        return c.json({ error: `Permission denied: ${permission}` }, 403);
+      }
+      c.set("user", { ...user, admin: true, adminRecord });
+      await next();
+    } catch (e) {
+      return c.json({ error: "Invalid or expired token", detail: String(e.message || e) }, 401);
+    }
+  };
+}
+
+export function requireAdminAnyPermission(permissions) {
+  return async (c, next) => {
+    const authHeader = c.req.header("Authorization") || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!token) return c.json({ error: "Missing Authorization bearer token" }, 401);
+    try {
+      const user = await verifyIdToken(token, c.env.FIREBASE_PROJECT_ID);
+      const adminRecord = await ensureLegacyAdminRecord(c.env, user);
+      const active = adminRecord && !["suspended","deleted","inactive"].includes(adminRecord.status || "active");
+      if (!active) return c.json({ error: "Admin access required" }, 403);
+      if (adminRecord.role !== "Admin" && !user.admin && !permissions.some((p) => permissionAllowed(adminRecord, p))) return c.json({ error: "Permission denied" }, 403);
+      if (adminRecord.role !== "Admin" && user.admin && !permissions.some((p) => permissionAllowed(adminRecord, p))) return c.json({ error: "Permission denied" }, 403);
+      c.set("user", { ...user, admin: true, adminRecord });
+      await next();
+    } catch (e) {
+      return c.json({ error: "Invalid or expired token", detail: String(e.message || e) }, 401);
+    }
+  };
 }

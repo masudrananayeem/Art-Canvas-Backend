@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { requireAuth, requireAdmin } from "./auth.js";
+import { requireAuth, requireAdmin, requireAdminPermission, requireAdminAnyPermission } from "./auth.js";
 import { fsGet, fsList, fsCreate, fsPatch, fsDelete, fsQueryEquals, fsRunTransaction } from "./firestore.js";
 import { buildCloudinarySignature } from "./cloudinary.js";
 
@@ -11,6 +11,15 @@ app.use(
   cors({
     origin: (origin, c) => {
       const allowed = (c.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
+      // Always allow the two local frontend apps during development. This keeps
+      // local Admin/Client working even when .dev.vars only contains production origins.
+      const localOrigins = new Set([
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+      ]);
+      if (localOrigins.has(origin)) return origin;
       if (allowed.length === 0) return origin; // dev fallback: reflect origin
       return allowed.includes(origin) ? origin : allowed[0];
     },
@@ -83,7 +92,7 @@ function normalizeProductImages(body) {
   return urls.slice(0, 8);
 }
 
-const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "rating", "reviews", "seed", "isFeatured", "sold"];
+const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "rating", "reviews", "seed", "isFeatured", "sold", "productCode"];
 
 // The five categories the store ships with. They always appear in
 // GET /api/categories and can't be deleted — admins can only add to this
@@ -152,12 +161,12 @@ app.get("/api/products/:id", async (c) => {
 
 // ---------- products: admin ----------
 
-app.get("/api/admin/products", requireAdmin, async (c) => {
+app.get("/api/admin/products", requireAdminPermission("manageProducts"), async (c) => {
   const products = await fsList(c.env, "products");
   return c.json(products);
 });
 
-app.post("/api/admin/products", requireAdmin, async (c) => {
+app.post("/api/admin/products", requireAdminPermission("manageProducts"), async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!isValidProductInput(body)) return c.json({ error: "name and price are required" }, 400);
 
@@ -176,6 +185,7 @@ app.post("/api/admin/products", requireAdmin, async (c) => {
     reviews: Number.isFinite(body.reviews) ? body.reviews : 0,
     isFeatured: body.isFeatured === true,
     sold: 0,
+    productCode: body.productCode || `AC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`,
     seed: body.seed || `ac-clothing-${Math.floor(Math.random() * 6)}`,
     createdAt: new Date().toISOString(),
   };
@@ -183,7 +193,7 @@ app.post("/api/admin/products", requireAdmin, async (c) => {
   return c.json(created, 201);
 });
 
-app.patch("/api/admin/products/:id", requireAdmin, async (c) => {
+app.patch("/api/admin/products/:id", requireAdminPermission("manageProducts"), async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
@@ -210,7 +220,7 @@ app.patch("/api/admin/products/:id", requireAdmin, async (c) => {
   }
 });
 
-app.delete("/api/admin/products/:id", requireAdmin, async (c) => {
+app.delete("/api/admin/products/:id", requireAdminPermission("manageProducts"), async (c) => {
   await fsDelete(c.env, `products/${c.req.param("id")}`);
   return c.json({ ok: true });
 });
@@ -228,7 +238,7 @@ app.get("/api/categories", async (c) => {
   return c.json(all);
 });
 
-app.get("/api/admin/categories", requireAdmin, async (c) => {
+app.get("/api/admin/categories", requireAdminPermission("manageCategories"), async (c) => {
   const custom = await fsList(c.env, "categories");
   const settings = await getCategorySettings(c.env);
   const hidden = new Set(settings.hidden);
@@ -245,7 +255,7 @@ app.get("/api/admin/categories", requireAdmin, async (c) => {
   return c.json([...builtins, ...customs]);
 });
 
-app.patch("/api/admin/categories/:id", requireAdmin, async (c) => {
+app.patch("/api/admin/categories/:id", requireAdminPermission("manageCategories"), async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => null);
   const name = typeof body?.name === "string" ? body.name.trim() : "";
@@ -266,7 +276,7 @@ app.patch("/api/admin/categories/:id", requireAdmin, async (c) => {
   return c.json(await fsPatch(c.env, `categories/${id}`, { name }));
 });
 
-app.post("/api/admin/categories", requireAdmin, async (c) => {
+app.post("/api/admin/categories", requireAdminPermission("manageCategories"), async (c) => {
   const body = await c.req.json().catch(() => null);
   const name = typeof body?.name === "string" ? body.name.trim() : "";
   if (!name) return c.json({ error: "Category name is required" }, 400);
@@ -292,7 +302,7 @@ app.post("/api/admin/categories", requireAdmin, async (c) => {
   return c.json({ id: created.id, name: created.name, builtin: false }, 201);
 });
 
-app.delete("/api/admin/categories/:id", requireAdmin, async (c) => {
+app.delete("/api/admin/categories/:id", requireAdminPermission("manageCategories"), async (c) => {
   const id = c.req.param("id");
   const products = await fsList(c.env, "products");
   const inUse = products.filter((p) => p.category === id).length;
@@ -333,7 +343,7 @@ app.get("/api/subcategories", async (c) => {
   return c.json(result);
 });
 
-app.get("/api/admin/subcategories", requireAdmin, async (c) => {
+app.get("/api/admin/subcategories", requireAdminPermission("manageCategories"), async (c) => {
   const custom = await fsList(c.env, "subcategories");
   const byGender = Object.fromEntries(custom.map((d) => [d.id, d]));
   const result = {};
@@ -354,7 +364,7 @@ app.get("/api/admin/subcategories", requireAdmin, async (c) => {
   return c.json(result);
 });
 
-app.post("/api/admin/subcategories", requireAdmin, async (c) => {
+app.post("/api/admin/subcategories", requireAdminPermission("manageCategories"), async (c) => {
   const body = await c.req.json().catch(() => null);
   const gender = body?.gender;
   const name = typeof body?.name === "string" ? body.name.trim() : "";
@@ -382,7 +392,7 @@ app.post("/api/admin/subcategories", requireAdmin, async (c) => {
   return c.json({ gender, items: saved.items }, 201);
 });
 
-app.patch("/api/admin/subcategories", requireAdmin, async (c) => {
+app.patch("/api/admin/subcategories", requireAdminPermission("manageCategories"), async (c) => {
   const body = await c.req.json().catch(() => null);
   const gender = body?.gender;
   const oldName = typeof body?.oldName === "string" ? body.oldName.trim() : "";
@@ -420,7 +430,7 @@ app.patch("/api/admin/subcategories", requireAdmin, async (c) => {
   return c.json({ gender, name: newName, builtin: false, saved });
 });
 
-app.delete("/api/admin/subcategories", requireAdmin, async (c) => {
+app.delete("/api/admin/subcategories", requireAdminPermission("manageCategories"), async (c) => {
   const body = await c.req.json().catch(() => null);
   const gender = body?.gender;
   const name = typeof body?.name === "string" ? body.name.trim() : "";
@@ -484,7 +494,7 @@ app.get("/api/site-content", async (c) => {
   return c.json({ ...SITE_CONTENT_DEFAULTS, ...(doc || {}) });
 });
 
-app.patch("/api/admin/site-content", requireAdmin, async (c) => {
+app.patch("/api/admin/site-content", requireAdminPermission("manageHomepage"), async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
   const update = {};
@@ -502,10 +512,16 @@ function publicUser(claims, profile) {
   return {
     uid: claims.uid,
     email: claims.email,
-    admin: !!claims.admin,
-    name: profile?.name || claims.name || "",
-    phone: profile?.phone || "",
-    photoURL: profile?.photoURL || "",
+    admin: !!claims.admin || !!claims.adminRecord,
+    role: claims.adminRecord?.role || null,
+    permissions: claims.adminRecord?.permissions || null,
+    status: claims.adminRecord?.status || null,
+    createdAt: claims.adminRecord?.createdAt || null,
+    updatedAt: claims.adminRecord?.updatedAt || null,
+    lastLogin: claims.adminRecord?.lastLogin || null,
+    name: profile?.name || claims.adminRecord?.name || claims.name || "",
+    phone: profile?.phone || claims.adminRecord?.phone || "",
+    photoURL: profile?.photoURL || claims.adminRecord?.avatar || "",
     address: profile?.address || null,
   };
 }
@@ -557,9 +573,26 @@ app.post("/api/orders", requireAuth, async (c) => {
   const paymentRef = paymentMethod !== "cod" && typeof body.paymentRef === "string"
     ? body.paymentRef.trim().slice(0, 60)
     : "";
+  const paymentPayerName = paymentMethod !== "cod" && typeof body.paymentPayerName === "string" ? body.paymentPayerName.trim().slice(0, 120) : "";
+  const paymentProductCodes = Array.isArray(body.paymentProductCodes) ? body.paymentProductCodes.map((x) => String(x).trim()).filter(Boolean).slice(0, 30) : [];
   if (paymentMethod !== "cod" && !paymentRef) {
     return c.json({ error: `Please provide the ${paymentMethod === "bkash" ? "bKash" : "Nagad"} transaction ID` }, 400);
   }
+
+  const paymentConfig = await fsGet(c.env, "storeSettings/payment").catch(() => null);
+  const deliveryCharge = Math.max(0, Number(paymentConfig?.deliveryCharge) || 0);
+  const returnCharge = Math.max(0, Number(paymentConfig?.returnCharge) || 0);
+  let membership = null;
+  let membershipDiscountPercent = 0;
+  let useCoins = body?.useCoins === true;
+  let coinDiscount = 0;
+  let coinsUsed = 0;
+  try {
+    const membershipRecord = await fsGet(c.env, `memberships/${user.uid}`);
+    if (membershipRecord?.status === "active") membership = membershipRecord;
+  } catch {}
+  const coinSettings = await getCoinSettings(c.env);
+
 
   // Consolidate duplicate cart lines first. This prevents reserving the same
   // product twice in one checkout and makes the transaction deterministic.
@@ -578,6 +611,7 @@ app.post("/api/orders", requireAuth, async (c) => {
       const orderItems = [];
       const stockWrites = [];
       let total = 0;
+      let subtotal = 0;
 
       for (const [id, qty] of quantities) {
         const product = await get(`products/${id}`);
@@ -608,16 +642,50 @@ app.post("/api/orders", requireAuth, async (c) => {
         };
         stockWrites[stockWrites.length - 1].updateMask = { fieldPaths: ["stock", "sold"] };
 
-        orderItems.push({ id: product.id, name: product.name, price, image: product.image || "", qty });
-        total += price * qty;
+        orderItems.push({ id: product.id, productCode: product.productCode || product.id, name: product.name, price, image: product.image || "", qty });
+        subtotal += price * qty;
       }
 
+      // Reward coins are redeemed inside the same Firestore transaction as the
+      // order, so two checkout requests cannot spend the same balance. The
+      // balance is read server-side and is never returned to the customer.
+      let membershipTx = null;
+      if (membership?.status === "active") {
+        membershipTx = await get(`memberships/${user.uid}`);
+        if (membershipTx?.status === "active" && useCoins && coinSettings.enabled) {
+          const balance = Math.max(0, Math.floor(Number(membershipTx.coinBalance) || 0));
+          const maxDiscount = subtotal * (Math.max(1, Math.min(100, Number(coinSettings.maxRedeemPercent) || 30)) / 100);
+          const valuePerCoin = Math.max(0.01, Number(coinSettings.coinValue) || 1);
+          coinsUsed = Math.min(balance, Math.floor(maxDiscount / valuePerCoin));
+          if (coinsUsed >= Math.max(1, Math.floor(Number(coinSettings.minRedeemCoins) || 1))) coinDiscount = Math.round(coinsUsed * valuePerCoin * 100) / 100;
+          else coinsUsed = 0;
+          if (coinsUsed > 0) {
+            stockWrites.push({
+              update: {
+                name: membershipTx.resourceName || `projects/${c.env.FIREBASE_PROJECT_ID}/databases/(default)/documents/memberships/${user.uid}`,
+                fields: { coinBalance: { integerValue: String(Math.max(0, balance - coinsUsed)) }, updatedAt: { timestampValue: now } },
+              },
+              updateMask: { fieldPaths: ["coinBalance", "updatedAt"] },
+            });
+          }
+        }
+      }
+      const discount = Math.round(subtotal * membershipDiscountPercent) / 100;
+      total = Math.max(0, subtotal - discount - coinDiscount + deliveryCharge);
       const orderData = {
         uid: user.uid,
         email: user.email || "",
         customerName: shipping.fullName,
         phone: shipping.phone,
         items: orderItems,
+        subtotal,
+        discount,
+        coinDiscount,
+        coinsUsed,
+        membershipDiscountPercent,
+        membershipPlan: membership?.planName || null,
+        deliveryCharge,
+        returnCharge,
         total,
         status: "placed",
         statusHistory: [{ status: "placed", at: now }],
@@ -625,6 +693,12 @@ app.post("/api/orders", requireAuth, async (c) => {
         shipping,
         paymentMethod,
         paymentRef,
+        paymentPayerName,
+        paymentProductCodes,
+        paymentStatus: paymentMethod === "cod" ? "not_required" : "pending",
+        paymentVerifiedAt: null,
+        paymentVerifiedBy: null,
+        paymentNote: "",
       };
 
       const orderName = `projects/${c.env.FIREBASE_PROJECT_ID}/databases/(default)/documents/orders/${orderId}`;
@@ -638,6 +712,8 @@ app.post("/api/orders", requireAuth, async (c) => {
 
     // Return the exact order document after the atomic transaction.
     const saved = await fsGet(c.env, `orders/${result.id}`);
+    // Do not expose coin balance or coin earning details in the customer response.
+    if (saved) { delete saved.coinsUsed; delete saved.coinsEarned; delete saved.coinBalance; }
     return c.json(saved || result, 201);
   } catch (e) {
     const status = Number.isInteger(e?.status) ? e.status : 500;
@@ -673,7 +749,7 @@ app.get("/api/orders/me", requireAuth, async (c) => {
   return c.json(mine);
 });
 
-app.get("/api/admin/orders", requireAdmin, async (c) => {
+app.get("/api/admin/orders", requireAdminAnyPermission(["manageOrders","managePayments"]), async (c) => {
   const all = await fsList(c.env, "orders");
   all.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return c.json(all);
@@ -681,7 +757,7 @@ app.get("/api/admin/orders", requireAdmin, async (c) => {
 
 // Admin order workflow. Cancelling an order restores the purchased quantities
 // exactly once; changing away from cancelled does not reserve them again.
-app.patch("/api/admin/orders/:id", requireAdmin, async (c) => {
+app.patch("/api/admin/orders/:id", requireAdminPermission("manageOrders"), async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => null);
   const allowed = new Set(["placed", "confirmed", "processing", "shipped", "delivered", "cancelled"]);
@@ -725,10 +801,33 @@ app.patch("/api/admin/orders/:id", requireAdmin, async (c) => {
     statusHistory: nextHistory,
     updatedAt: now,
   });
+  await recordAudit(c.env,c.get("user"),"order_status_updated","order",id,order.customerName||order.email,`${order.status} → ${status}`);
+  if (status === "delivered") await maybeAwardCoins(c.env, { ...saved, id }, "delivered_purchase");
   return c.json(saved);
 });
 
-app.delete("/api/admin/orders/:id", requireAdmin, async (c) => {
+app.patch("/api/admin/orders/:id/payment", requireAdminPermission("managePayments"), async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  const paymentStatus = body?.paymentStatus;
+  if (!["pending","verified","rejected","not_required"].includes(paymentStatus)) return c.json({ error: "Invalid payment status" }, 400);
+  const order = await fsGet(c.env, `orders/${id}`);
+  if (!order) return c.json({ error: "Order not found" }, 404);
+  const now = new Date().toISOString();
+  const saved = await fsPatch(c.env, `orders/${id}`, {
+    paymentStatus,
+    paymentVerifiedAt: paymentStatus === "verified" ? now : null,
+    paymentVerifiedBy: typeof body?.verifiedBy === "string" ? body.verifiedBy.slice(0, 160) : "",
+    paymentNote: typeof body?.note === "string" ? body.note.slice(0, 500) : (order.paymentNote || ""),
+    paymentVerifiedByName: typeof body?.verifiedByName === "string" ? body.verifiedByName.slice(0, 160) : (order.paymentVerifiedByName || ""),
+    updatedAt: now,
+  });
+  await recordAudit(c.env,c.get("user"),paymentStatus==="verified"?"payment_verified":"payment_updated","order",id,order.customerName||order.email,`Payment ${paymentStatus}; transaction ${order.paymentRef||"—"}`);
+  if (paymentStatus === "verified") await maybeAwardCoins(c.env, { ...saved, id }, "verified_payment");
+  return c.json(saved);
+});
+
+app.delete("/api/admin/orders/:id", requireAdminPermission("manageOrders"), async (c) => {
   const id = c.req.param("id");
   const order = await fsGet(c.env, `orders/${id}`);
   if (!order) return c.json({ error: "Order not found" }, 404);
@@ -736,6 +835,286 @@ app.delete("/api/admin/orders/:id", requireAdmin, async (c) => {
   await fsDelete(c.env, `orders/${id}`);
   return c.json({ ok: true });
 });
+
+
+
+async function recordAudit(env, user, action, targetType, targetId, targetName, details="") {
+  try { await fsCreate(env, "auditLogs", { adminId:user?.uid||"", adminName:user?.name||user?.email||"Admin", adminEmail:user?.email||"", action, targetType, targetId:String(targetId||""), targetName:String(targetName||"").slice(0,180), details:String(details||"").slice(0,500), timestamp:new Date().toISOString() }); } catch {}
+}
+
+// ---------- admin management / requests / audit ----------
+app.get("/api/admin/admins", requireAdminPermission("manageAdmins"), async (c)=>{
+  const all=await fsList(c.env,"adminUsers");
+  return c.json(all.filter(x=>!String(x.id||"").startsWith("temp_")&&x.status!=="deleted").sort((a,b)=>(a.createdAt||"")<(b.createdAt||"")?1:-1));
+});
+app.post("/api/admin/admins", requireAdminPermission("manageAdmins"), async (c)=>{
+  const b=await c.req.json().catch(()=>null); if(!b?.email) return c.json({error:"Email is required"},400);
+  const users=await fsList(c.env,"users"); const user=users.find(x=>String(x.email||"").toLowerCase()===String(b.email).toLowerCase());
+  const uid=user?.id || b.uid; if(!uid) return c.json({error:"Customer must sign in/create an ArtCanvas account first so the admin profile can be linked securely."},409);
+  const current=await fsGet(c.env,`adminUsers/${uid}`); const now=new Date().toISOString();
+  const record={id:uid,name:String(b.name||user?.name||b.email).slice(0,120),email:String(b.email).toLowerCase().slice(0,160),role:b.role||"Moderator",status:b.status||"active",permissions:b.permissions||{},createdAt:current?.createdAt||now,createdBy:b.createdBy||c.get("user")?.uid,updatedAt:now};
+  const saved=current ? await fsPatch(c.env,`adminUsers/${uid}`,record) : await fsCreate(c.env,"adminUsers",record,uid);
+  await recordAudit(c.env,c.get("user"),current?"admin_updated":"admin_created","admin",uid,record.name,`Role: ${record.role}`);
+  return c.json(saved);
+});
+app.patch("/api/admin/admins/:id", requireAdminPermission("manageAdmins"), async(c)=>{const id=c.req.param("id"),b=await c.req.json().catch(()=>null),cur=await fsGet(c.env,`adminUsers/${id}`);if(!cur)return c.json({error:"Admin not found"},404);const patch={};for(const k of ["name","role","status","permissions","phone","location","bio","avatar","facebook","whatsapp","twitter","linkedin","instagram"])if(k in (b||{}))patch[k]=b[k];patch.updatedAt=new Date().toISOString();return c.json(await fsPatch(c.env,`adminUsers/${id}`,patch));});
+app.delete("/api/admin/admins/:id", requireAdminPermission("manageAdmins"), async(c)=>{const id=c.req.param("id");if(id===c.get("user")?.uid)return c.json({error:"You cannot remove your own admin access."},409);await fsPatch(c.env,`adminUsers/${id}`,{status:"deleted",deletedAt:new Date().toISOString()});return c.json({ok:true});});
+app.post("/api/admin/access-requests", async(c)=>{const b=await c.req.json().catch(()=>null);if(!b?.email||!b?.name)return c.json({error:"Name and email are required"},400);const email=String(b.email).trim().toLowerCase();const existing=(await fsList(c.env,"adminRequests")).find(x=>String(x.email||"").toLowerCase()===email&&x.status==="pending");if(existing)return c.json({error:"A pending request already exists"},409);return c.json(await fsCreate(c.env,"adminRequests",{name:String(b.name).slice(0,120),email,requestedRole:b.requestedRole||"Moderator",reason:String(b.reason||"").slice(0,500),status:"pending",createdAt:new Date().toISOString()}),201);});
+app.get("/api/admin/access-requests", requireAdminPermission("manageAdmins"), async(c)=>{const all=await fsList(c.env,"adminRequests");return c.json(all.sort((a,b)=>(a.createdAt||"")<(b.createdAt||"")?1:-1));});
+app.patch("/api/admin/access-requests/:id", requireAdminPermission("manageAdmins"), async(c)=>{const id=c.req.param("id"),b=await c.req.json().catch(()=>null),cur=await fsGet(c.env,`adminRequests/${id}`);if(!cur)return c.json({error:"Request not found"},404);const status=["approved","rejected","pending"].includes(b?.status)?b.status:cur.status;const now=new Date().toISOString();const saved=await fsPatch(c.env,`adminRequests/${id}`,{status,reviewedAt:now,reviewedBy:b?.reviewerId||c.get("user")?.uid||"",reviewerName:b?.reviewerName||c.get("user")?.name||"Admin",reviewerNotes:String(b?.reviewerNotes||"").slice(0,500),assignedRole:b?.assignedRole||cur.requestedRole||"Moderator",assignedPermissions:b?.assignedPermissions||{}});if(status==="approved"){const users=await fsList(c.env,"users");const u=users.find(x=>String(x.email||"").toLowerCase()===String(cur.email||"").toLowerCase());if(u?.id){const adminPayload={name:cur.name||u.name||cur.email,email:cur.email,role:b?.assignedRole||cur.requestedRole||"Moderator",permissions:b?.assignedPermissions||{},status:"active",createdAt:now,createdBy:c.get("user")?.uid||"admin"};const existingAdmin=await fsGet(c.env,`adminUsers/${u.id}`);if(existingAdmin)await fsPatch(c.env,`adminUsers/${u.id}`,adminPayload);else await fsCreate(c.env,"adminUsers",adminPayload,u.id);await recordAudit(c.env,c.get("user"),"admin_request_approved","adminRequest",id,cur.name||cur.email,`Role: ${adminPayload.role}`);}}return c.json(saved);});
+app.get("/api/admin/audit", requireAdminPermission("viewAuditLogs"), async(c)=>{const all=await fsList(c.env,"auditLogs");const n=Math.min(500,Math.max(1,Number(c.req.query("limit")||200)));return c.json(all.sort((a,b)=>(a.timestamp||"")<(b.timestamp||"")?1:-1).slice(0,n));});
+
+// ---------- payment settings ----------
+const DEFAULT_PAYMENT_SETTINGS = {
+  bkash: { number: "01820050464", label: "bKash", accountType: "Personal" },
+  nagad: { number: "01820050464", label: "Nagad", accountType: "Personal" },
+  cashOnDelivery: true,
+  onlinePaymentEnabled: true,
+  deliveryCharge: 0,
+  returnCharge: 0,
+};
+
+app.get("/api/payment-settings", async (c) => {
+  const saved = await fsGet(c.env, "storeSettings/payment");
+  return c.json({ ...DEFAULT_PAYMENT_SETTINGS, ...(saved || {}), bkash: { ...DEFAULT_PAYMENT_SETTINGS.bkash, ...(saved?.bkash || {}) }, nagad: { ...DEFAULT_PAYMENT_SETTINGS.nagad, ...(saved?.nagad || {}) } });
+});
+
+app.get("/api/admin/payment-settings", requireAdminPermission("managePayments"), async (c) => {
+  const saved = await fsGet(c.env, "storeSettings/payment");
+  return c.json({ ...DEFAULT_PAYMENT_SETTINGS, ...(saved || {}), bkash: { ...DEFAULT_PAYMENT_SETTINGS.bkash, ...(saved?.bkash || {}) }, nagad: { ...DEFAULT_PAYMENT_SETTINGS.nagad, ...(saved?.nagad || {}) } });
+});
+
+app.patch("/api/admin/payment-settings", requireAdminPermission("managePayments"), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const current = await fsGet(c.env, "storeSettings/payment") || {};
+  const cleanNumber = (v, fallback) => typeof v === "string" && v.trim() ? v.trim().slice(0, 30) : fallback;
+  const next = {
+    ...DEFAULT_PAYMENT_SETTINGS,
+    ...current,
+    bkash: { ...DEFAULT_PAYMENT_SETTINGS.bkash, ...(current.bkash || {}), number: cleanNumber(body?.bkash?.number, current.bkash?.number || DEFAULT_PAYMENT_SETTINGS.bkash.number) },
+    nagad: { ...DEFAULT_PAYMENT_SETTINGS.nagad, ...(current.nagad || {}), number: cleanNumber(body?.nagad?.number, current.nagad?.number || DEFAULT_PAYMENT_SETTINGS.nagad.number) },
+    cashOnDelivery: body?.cashOnDelivery !== undefined ? body.cashOnDelivery === true : current.cashOnDelivery !== false,
+    onlinePaymentEnabled: body?.onlinePaymentEnabled !== undefined ? body.onlinePaymentEnabled === true : current.onlinePaymentEnabled !== false,
+    deliveryCharge: body?.deliveryCharge !== undefined ? Math.max(0, Number(body.deliveryCharge)||0) : Math.max(0, Number(current.deliveryCharge)||0),
+    returnCharge: body?.returnCharge !== undefined ? Math.max(0, Number(body.returnCharge)||0) : Math.max(0, Number(current.returnCharge)||0),
+    updatedAt: new Date().toISOString(),
+  };
+  const saved = await fsGet(c.env,"storeSettings/payment");
+  return c.json(saved ? await fsPatch(c.env,"storeSettings/payment",next) : await fsCreate(c.env,"storeSettings",next,"payment"));
+});
+
+// ---------- ArtCanvas membership + reward coins ----------
+// Membership is FREE. A customer requests membership and an admin approves it,
+// or an admin can add an existing ArtCanvas account directly. Coin balances are
+// intentionally NEVER returned by public/member endpoints.
+const DEFAULT_COIN_SETTINGS = {
+  enabled: true,
+  earnPer100: 1,
+  coinValue: 1,
+  maxRedeemPercent: 30,
+  minRedeemCoins: 1,
+};
+
+function safeMembership(record) {
+  if (!record) return null;
+  return {
+    uid: record.uid,
+    email: record.email || "",
+    phone: record.phone || "",
+    name: record.name || "",
+    status: record.status || "pending",
+    joinedAt: record.joinedAt || null,
+    approvedAt: record.approvedAt || null,
+    planName: "ArtCanvas Member",
+  };
+}
+
+async function getCoinSettings(env) {
+  const saved = await fsGet(env, "storeSettings/coins").catch(() => null);
+  return { ...DEFAULT_COIN_SETTINGS, ...(saved || {}) };
+}
+
+async function getProductCoinRule(env, productId) {
+  const rule = await fsGet(env, `coinRules/${productId}`).catch(() => null);
+  return rule || null;
+}
+
+async function calculateEarnedCoins(env, orderItems) {
+  const settings = await getCoinSettings(env);
+  if (!settings.enabled) return 0;
+  let coins = 0;
+  for (const item of Array.isArray(orderItems) ? orderItems : []) {
+    const rule = await getProductCoinRule(env, item.id);
+    if (rule?.disabled === true) continue;
+    const qty = Math.max(1, Math.floor(Number(item.qty) || 1));
+    const rate = rule?.earnPer100 !== undefined ? Math.max(0, Number(rule.earnPer100) || 0) : Math.max(0, Number(settings.earnPer100) || 0);
+    coins += Math.floor((Number(item.price) * qty / 100) * rate);
+  }
+  return Math.max(0, Math.floor(coins));
+}
+
+async function maybeAwardCoins(env, order, reason) {
+  if (!order?.uid || order.coinsAwardedAt || order.status === "cancelled") return null;
+  const paymentReady = order.paymentMethod === "cod" ? order.status === "delivered" : order.paymentStatus === "verified";
+  if (!paymentReady) return null;
+  const membership = await fsGet(env, `memberships/${order.uid}`).catch(() => null);
+  if (!membership || membership.status !== "active") return null;
+  const earned = await calculateEarnedCoins(env, order.items);
+  const now = new Date().toISOString();
+  const currentBalance = Math.max(0, Math.floor(Number(membership.coinBalance) || 0));
+  const saved = await fsPatch(env, `memberships/${order.uid}`, {
+    coinBalance: currentBalance + earned,
+    lastCoinAward: earned,
+    lastCoinAwardAt: now,
+    updatedAt: now,
+  });
+  await fsPatch(env, `orders/${order.id}`, { coinsEarned: earned, coinsAwardedAt: now, coinsAwardReason: reason || "completed_purchase" }).catch(() => {});
+  await fsCreate(env, "coinLedger", {
+    uid: order.uid,
+    orderId: order.id,
+    type: "earn",
+    coins: earned,
+    reason: reason || "completed_purchase",
+    createdAt: now,
+  }).catch(() => {});
+  return saved;
+}
+
+app.get("/api/membership-plans", async (c) => {
+  return c.json([{ id: "member", name: "ArtCanvas Member", description: "Free membership with reward coins, member announcements and special offers.", price: 0, active: true }]);
+});
+
+app.get("/api/membership/me", requireAuth, async (c) => {
+  const uid = c.get("user").uid;
+  const membership = await fsGet(c.env, `memberships/${uid}`).catch(() => null);
+  if (membership) return c.json(safeMembership(membership));
+  const pending = (await fsList(c.env, "membershipRequests").catch(() => [])).find(x => x.uid === uid && x.status === "pending");
+  return c.json(pending ? safeMembership({ ...pending, status: "pending" }) : null);
+});
+
+// Customer asks to become a FREE ArtCanvas member. Approval is required.
+app.post("/api/membership/request", requireAuth, async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  const name = String(body?.name || user.name || "ArtCanvas Customer").trim().slice(0, 120);
+  const phone = String(body?.phone || "").trim().slice(0, 40);
+  const email = String(user.email || body?.email || "").trim().toLowerCase().slice(0, 160);
+  if (!email && !phone) return c.json({ error: "Email or phone number is required for membership." }, 400);
+  const existing = await fsGet(c.env, `memberships/${user.uid}`).catch(() => null);
+  if (existing?.status === "active") return c.json(safeMembership(existing));
+  const requests = await fsList(c.env, "membershipRequests").catch(() => []);
+  const pending = requests.find(x => x.uid === user.uid && x.status === "pending");
+  if (pending) return c.json(safeMembership({ ...pending, status: "pending" }));
+  const now = new Date().toISOString();
+  const request = await fsCreate(c.env, "membershipRequests", { uid:user.uid, name, email, phone, status:"pending", createdAt:now }, user.uid);
+  return c.json(safeMembership({ ...request, status:"pending" }), 201);
+});
+
+app.get("/api/admin/members", requireAdminPermission("manageMembership"), async (c) => {
+  const all = await fsList(c.env, "memberships");
+  return c.json(all.filter(x => x.status === "active").map(x => ({ ...x, coinBalance: Math.max(0, Math.floor(Number(x.coinBalance)||0)) })).sort((a,b)=>(a.joinedAt||"")<(b.joinedAt||"")?1:-1));
+});
+
+app.get("/api/admin/membership-requests", requireAdminPermission("manageMembership"), async (c) => {
+  const all = await fsList(c.env, "membershipRequests");
+  return c.json(all.sort((a,b)=>(a.createdAt||"")<(b.createdAt||"")?1:-1));
+});
+
+app.patch("/api/admin/membership-requests/:id", requireAdminPermission("manageMembership"), async (c) => {
+  const id=c.req.param("id"), b=await c.req.json().catch(()=>({}));
+  const cur=await fsGet(c.env,`membershipRequests/${id}`);
+  if(!cur) return c.json({error:"Membership request not found"},404);
+  const status=["approved","rejected","pending"].includes(b?.status)?b.status:cur.status;
+  const now=new Date().toISOString();
+  const saved=await fsPatch(c.env,`membershipRequests/${id}`,{status,reviewedAt:now,reviewedBy:c.get("user")?.uid||"",reviewerName:c.get("user")?.name||c.get("user")?.email||"Admin"});
+  if(status==="approved") {
+    const existing=await fsGet(c.env,`memberships/${cur.uid}`).catch(()=>null);
+    const membership={uid:cur.uid,name:cur.name||"Member",email:cur.email||"",phone:cur.phone||"",status:"active",coinBalance:Math.max(0,Math.floor(Number(existing?.coinBalance)||0)),joinedAt:existing?.joinedAt||now,approvedAt:now,updatedAt:now};
+    const result=existing?await fsPatch(c.env,`memberships/${cur.uid}`,membership):await fsCreate(c.env,"memberships",membership,cur.uid);
+    await fsCreate(c.env,"messages",{uid:cur.uid,email:cur.email||"",from:"admin",text:"Your ArtCanvas membership request has been approved. Welcome to the ArtCanvas Member community.",seenByAdmin:true,createdAt:now}).catch(()=>{});
+    await recordAudit(c.env,c.get("user"),"membership_approved","membership",cur.uid,cur.name||cur.email,"Membership approved");
+    return c.json({ ...saved, membership:safeMembership(result) });
+  }
+  await recordAudit(c.env,c.get("user"),`membership_${status}`,"membershipRequest",id,cur.name||cur.email,`Membership request ${status}`);
+  return c.json(saved);
+});
+
+// Admin can add an existing ArtCanvas account directly by email or phone.
+app.post("/api/admin/members", requireAdminPermission("manageMembership"), async (c) => {
+  const b=await c.req.json().catch(()=>({}));
+  const email=String(b?.email||"").trim().toLowerCase();
+  const phone=String(b?.phone||"").trim();
+  if(!email && !phone) return c.json({error:"Email or phone is required"},400);
+  const users=await fsList(c.env,"users");
+  const u=users.find(x=>(email && String(x.email||"").toLowerCase()===email)||(phone && String(x.phone||"").trim()===phone));
+  if(!u?.id) return c.json({error:"No ArtCanvas account found. The customer must sign in/register first."},404);
+  const now=new Date().toISOString(); const existing=await fsGet(c.env,`memberships/${u.id}`).catch(()=>null);
+  const membership={uid:u.id,name:String(b?.name||u.name||u.email||"Member").slice(0,120),email:u.email||email,phone:u.phone||phone,status:"active",coinBalance:Math.max(0,Math.floor(Number(b?.coinBalance ?? existing?.coinBalance)||0)),joinedAt:existing?.joinedAt||now,approvedAt:existing?.approvedAt||now,updatedAt:now};
+  const saved=existing?await fsPatch(c.env,`memberships/${u.id}`,membership):await fsCreate(c.env,"memberships",membership,u.id);
+  await recordAudit(c.env,c.get("user"),existing?"membership_updated":"membership_added","membership",u.id,membership.name,"Member added/updated by admin");
+  return c.json({ ...saved, coinBalance:Math.max(0,Math.floor(Number(saved.coinBalance)||0)) },201);
+});
+
+app.patch("/api/admin/members/:uid", requireAdminPermission("manageMembership"), async (c) => {
+  const uid=c.req.param("uid"), b=await c.req.json().catch(()=>({}));
+  const cur=await fsGet(c.env,`memberships/${uid}`); if(!cur) return c.json({error:"Member not found"},404);
+  const patch={updatedAt:new Date().toISOString()};
+  if(b?.status && ["active","suspended"].includes(b.status)) patch.status=b.status;
+  if(b?.name!==undefined) patch.name=String(b.name).slice(0,120);
+  if(b?.phone!==undefined) patch.phone=String(b.phone).slice(0,40);
+  if(b?.coinBalance!==undefined) patch.coinBalance=Math.max(0,Math.floor(Number(b.coinBalance)||0));
+  const saved=await fsPatch(c.env,`memberships/${uid}`,patch);
+  await recordAudit(c.env,c.get("user"),"membership_updated","membership",uid,cur.name||cur.email,"Member status/profile/coin balance updated");
+  return c.json({ ...saved, coinBalance:Math.max(0,Math.floor(Number(saved.coinBalance)||0)) });
+});
+
+app.get("/api/admin/coin-settings", requireAdminPermission("manageMembership"), async (c) => c.json(await getCoinSettings(c.env)));
+app.patch("/api/admin/coin-settings", requireAdminPermission("manageMembership"), async (c) => {
+  const b=await c.req.json().catch(()=>({})); const cur=await getCoinSettings(c.env);
+  const next={...cur,enabled:b.enabled!==undefined?b.enabled===true:cur.enabled,earnPer100:Math.max(0,Number(b.earnPer100??cur.earnPer100)||0),coinValue:Math.max(0.01,Number(b.coinValue??cur.coinValue)||1),maxRedeemPercent:Math.max(1,Math.min(100,Number(b.maxRedeemPercent??cur.maxRedeemPercent)||30)),minRedeemCoins:Math.max(1,Math.floor(Number(b.minRedeemCoins??cur.minRedeemCoins)||1)),updatedAt:new Date().toISOString()};
+  const saved=await fsGet(c.env,"storeSettings/coins"); return c.json(saved?await fsPatch(c.env,"storeSettings/coins",next):await fsCreate(c.env,"storeSettings",next,"coins"));
+});
+app.get("/api/admin/coin-rules", requireAdminPermission("manageMembership"), async (c) => c.json(await fsList(c.env,"coinRules")));
+app.patch("/api/admin/coin-rules/:productId", requireAdminPermission("manageMembership"), async (c) => {
+  const id=c.req.param("productId"), b=await c.req.json().catch(()=>({})); const current=await fsGet(c.env,`coinRules/${id}`).catch(()=>null);
+  const rule={productId:id,disabled:b.disabled===true,earnPer100:Math.max(0,Number(b.earnPer100)||0),updatedAt:new Date().toISOString()};
+  return c.json(current?await fsPatch(c.env,`coinRules/${id}`,rule):await fsCreate(c.env,"coinRules",rule,id));
+});
+
+// Admin can privately notify a member without exposing their coin balance.
+app.post("/api/admin/members/:uid/message", requireAdminPermission("manageMembership"), async (c) => {
+  const uid=c.req.param("uid"), b=await c.req.json().catch(()=>({})); const text=String(b?.text||"").trim().slice(0,3000); if(!text)return c.json({error:"Message is required"},400);
+  const member=await fsGet(c.env,`memberships/${uid}`); if(!member)return c.json({error:"Member not found"},404);
+  const msg=await fsCreate(c.env,"messages",{uid,email:member.email||"",from:"admin",text,seenByAdmin:true,createdAt:new Date().toISOString()});
+  return c.json(msg,201);
+});
+
+// Broadcast an in-app announcement to every active member.
+app.post("/api/admin/members/broadcast", requireAdminPermission("manageMembership"), async (c) => {
+  const b=await c.req.json().catch(()=>({})); const text=String(b?.text||"").trim().slice(0,3000); if(!text)return c.json({error:"Announcement message is required"},400);
+  const members=(await fsList(c.env,"memberships")).filter(x=>x.status==="active"); const now=new Date().toISOString(); let sent=0;
+  for(const m of members){await fsCreate(c.env,"messages",{uid:m.uid,email:m.email||"",from:"admin",text,seenByAdmin:true,createdAt:now});sent++;}
+  await recordAudit(c.env,c.get("user"),"membership_broadcast","membership","all","All members",`Announcement sent to ${sent} active members`);
+  return c.json({ok:true,sent});
+});
+
+// ---------- circulation ----------
+const CIRCULATION_STATUSES = ["loaned","due_soon","overdue","returned","shipped","in_transit","delivered","cancelled"];
+app.get("/api/circulation/me", requireAuth, async (c) => { const all=await fsList(c.env,"circulation"); return c.json(all.filter(x=>x.uid===c.get("user").uid).sort((a,b)=>a.dueDate<b.dueDate?1:-1)); });
+app.get("/api/admin/circulation", requireAdminPermission("manageCirculation"), async (c) => { const all=await fsList(c.env,"circulation"); return c.json(all.sort((a,b)=>(a.dueDate||"")<(b.dueDate||"")?1:-1)); });
+app.post("/api/admin/circulation", requireAdminPermission("manageCirculation"), async (c)=>{
+  const b=await c.req.json().catch(()=>null); if(!b?.uid || !b?.productName) return c.json({error:"Customer and product are required"},400);
+  const now=new Date().toISOString(); const rec={uid:String(b.uid), customerName:String(b.customerName||"Customer").slice(0,120), customerEmail:String(b.customerEmail||"").slice(0,160), productId:String(b.productId||""), productCode:String(b.productCode||b.productId||"").slice(0,80), productName:String(b.productName).slice(0,180), status:CIRCULATION_STATUSES.includes(b.status)?b.status:"loaned", loanDate:b.loanDate||now, dueDate:b.dueDate||null, returnedDate:b.returnedDate||null, shipmentStatus:String(b.shipmentStatus||"not_shipped"), trackingNumber:String(b.trackingNumber||"").slice(0,100), courierName:String(b.courierName||"").slice(0,100), notes:String(b.notes||"").slice(0,500), createdAt:now, updatedAt:now};
+  return c.json(await fsCreate(c.env,"circulation",rec),201);
+});
+app.patch("/api/admin/circulation/:id", requireAdminPermission("manageCirculation"), async (c)=>{const id=c.req.param("id"),b=await c.req.json().catch(()=>null),cur=await fsGet(c.env,`circulation/${id}`);if(!cur)return c.json({error:"Circulation record not found"},404);const patch={};for(const k of ["customerName","customerEmail","productId","productCode","productName","status","loanDate","dueDate","returnedDate","shipmentStatus","trackingNumber","courierName","notes"])if(k in (b||{}))patch[k]=b[k];if(patch.status&&!CIRCULATION_STATUSES.includes(patch.status))return c.json({error:"Invalid circulation status"},400);patch.updatedAt=new Date().toISOString();return c.json(await fsPatch(c.env,`circulation/${id}`,patch));});
+app.delete("/api/admin/circulation/:id", requireAdminPermission("manageCirculation"), async(c)=>{await fsDelete(c.env,`circulation/${c.req.param("id")}`);return c.json({ok:true});});
+
+// ---------- contact / complaint / feedback ----------
+app.post("/api/contact", async (c)=>{const b=await c.req.json().catch(()=>null);const email=String(b?.email||"").trim().toLowerCase();const name=String(b?.name||"").trim();const message=String(b?.message||"").trim();const type=["general","complaint","feedback"].includes(b?.type)?b.type:"general";if(!name||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!message)return c.json({error:"Name, valid email and message are required"},400);const rec={name:name.slice(0,120),email:email.slice(0,160),phone:String(b?.phone||"").slice(0,30),type,message:message.slice(0,3000),uid:c.get("user")?.uid||null,status:"new",createdAt:new Date().toISOString()};return c.json(await fsCreate(c.env,"contactSubmissions",rec),201);});
+app.get("/api/admin/contact", requireAdminPermission("manageContact"), async(c)=>{const all=await fsList(c.env,"contactSubmissions");return c.json(all.sort((a,b)=>a.createdAt<b.createdAt?1:-1));});
+app.patch("/api/admin/contact/:id", requireAdminPermission("manageContact"), async(c)=>{const id=c.req.param("id"),b=await c.req.json().catch(()=>null),cur=await fsGet(c.env,`contactSubmissions/${id}`);if(!cur)return c.json({error:"Message not found"},404);const status=["new","seen","in_progress","resolved","closed"].includes(b?.status)?b.status:cur.status;return c.json(await fsPatch(c.env,`contactSubmissions/${id}`,{status,adminNote:String(b?.adminNote||cur.adminNote||"").slice(0,1000),updatedAt:new Date().toISOString()}));});
+app.delete("/api/admin/contact/:id", requireAdminPermission("manageContact"), async(c)=>{await fsDelete(c.env,`contactSubmissions/${c.req.param("id")}`);return c.json({ok:true});});
 
 // ---------- messages (client <-> studio) ----------
 // Every message document: { uid, email, from: "user" | "admin", text, createdAt }
@@ -786,7 +1165,7 @@ app.get("/api/messages/me", requireAuth, async (c) => {
 });
 
 // Admin: list every conversation, most recently active first.
-app.get("/api/admin/messages/threads", requireAdmin, async (c) => {
+app.get("/api/admin/messages/threads", requireAdminPermission("manageMessages"), async (c) => {
   const all = await fsList(c.env, "messages");
   const byUid = new Map();
   for (const m of all) {
@@ -812,7 +1191,7 @@ app.get("/api/admin/messages/threads", requireAdmin, async (c) => {
 
 // Admin: find (or confirm) a client by email so a conversation can be opened
 // even before that client has sent a first message.
-app.post("/api/admin/messages/lookup", requireAdmin, async (c) => {
+app.post("/api/admin/messages/lookup", requireAdminPermission("manageMessages"), async (c) => {
   const body = await c.req.json().catch(() => null);
   const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
   if (!email) return c.json({ error: "Email is required" }, 400);
@@ -826,14 +1205,14 @@ app.post("/api/admin/messages/lookup", requireAdmin, async (c) => {
 });
 
 // Admin: read one client's full conversation.
-app.get("/api/admin/messages/:uid", requireAdmin, async (c) => {
+app.get("/api/admin/messages/:uid", requireAdminPermission("manageMessages"), async (c) => {
   const uid = c.req.param("uid");
   const thread = await fsQueryEquals(c.env, "messages", "uid", uid);
   return c.json(sortByCreatedAt(thread));
 });
 
 // Admin marks all customer messages in a thread as seen when opening it.
-app.patch("/api/admin/messages/:uid/read", requireAdmin, async (c) => {
+app.patch("/api/admin/messages/:uid/read", requireAdminPermission("manageMessages"), async (c) => {
   const uid = c.req.param("uid");
   const thread = await fsQueryEquals(c.env, "messages", "uid", uid);
   let updated = 0;
@@ -847,7 +1226,7 @@ app.patch("/api/admin/messages/:uid/read", requireAdmin, async (c) => {
 });
 
 // Admin: reply into a specific client's conversation.
-app.delete("/api/admin/messages/:uid/:messageId", requireAdmin, async (c) => {
+app.delete("/api/admin/messages/:uid/:messageId", requireAdminPermission("manageMessages"), async (c) => {
   const uid = c.req.param("uid");
   const messageId = c.req.param("messageId");
   const message = await fsGet(c.env, `messages/${messageId}`);
@@ -856,7 +1235,7 @@ app.delete("/api/admin/messages/:uid/:messageId", requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
-app.delete("/api/admin/messages/:uid", requireAdmin, async (c) => {
+app.delete("/api/admin/messages/:uid", requireAdminPermission("manageMessages"), async (c) => {
   const uid = c.req.param("uid");
   const thread = await fsQueryEquals(c.env, "messages", "uid", uid);
   for (const message of thread) {
@@ -865,7 +1244,7 @@ app.delete("/api/admin/messages/:uid", requireAdmin, async (c) => {
   return c.json({ ok: true, deleted: thread.length });
 });
 
-app.post("/api/admin/messages/:uid", requireAdmin, async (c) => {
+app.post("/api/admin/messages/:uid", requireAdminPermission("manageMessages"), async (c) => {
   const uid = c.req.param("uid");
   const body = await c.req.json().catch(() => null);
   const text = cleanMessageText(body);
