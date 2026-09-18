@@ -11,3 +11,8 @@ FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE K
 # From Cloudinary Console -> Dashboard
 CLOUDINARY_API_KEY=123456789012345
 CLOUDINARY_API_SECRET=your-cloudinary-api-secret
+
+# Transactional email (Resend)
+# Create an API key in Resend and verify the sender domain/email.
+RESEND_API_KEY=re_xxxxxxxxxxxxxxxxx
+RESEND_FROM_EMAIL=ArtCanvas <noreply@your-verified-domain.com>

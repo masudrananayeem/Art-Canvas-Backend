@@ -76,11 +76,24 @@ app.post("/api/newsletter", async (c) => {
 
 function publicProduct(p) {
   const { stock, ...rest } = p;
-  return { ...rest, inStock: (stock ?? 0) > 0, sold: Number.isFinite(p.sold) ? p.sold : 0 };
+  const productCode = p.productCode || `AC-${String(p.id || "PRODUCT").slice(-8).toUpperCase()}`;
+  return { ...rest, productCode, inStock: (stock ?? 0) > 0, sold: Number.isFinite(p.sold) ? p.sold : 0 };
 }
 
 function isValidProductInput(body) {
   return body && typeof body.name === "string" && body.name.trim().length > 0 && typeof body.price === "number" && body.price >= 0;
+}
+
+function normalizeProductSizes(body) {
+  const raw = Array.isArray(body?.sizes) ? body.sizes : [];
+  return raw.map((item) => ({
+    size: String(item?.size || "").trim().slice(0, 20),
+    stock: Math.max(0, Math.floor(Number(item?.stock) || 0)),
+  })).filter((item) => item.size).slice(0, 20);
+}
+
+function totalSizeStock(sizes) {
+  return Array.isArray(sizes) && sizes.length ? sizes.reduce((sum, item) => sum + Math.max(0, Math.floor(Number(item?.stock) || 0)), 0) : null;
 }
 
 function normalizeProductImages(body) {
@@ -92,7 +105,7 @@ function normalizeProductImages(body) {
   return urls.slice(0, 8);
 }
 
-const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "image", "imagePublicId", "images", "rating", "reviews", "seed", "isFeatured", "sold", "productCode"];
+const PRODUCT_FIELDS = ["name", "description", "price", "category", "gender", "subcategory", "stock", "sizes", "image", "imagePublicId", "images", "rating", "reviews", "seed", "isFeatured", "sold", "productCode"];
 
 // The five categories the store ships with. They always appear in
 // GET /api/categories and can't be deleted — admins can only add to this
@@ -177,7 +190,8 @@ app.post("/api/admin/products", requireAdminPermission("manageProducts"), async 
     category: body.category || "objects",
     gender: body.gender || "all",
     subcategory: body.subcategory || "",
-    stock: Number.isFinite(body.stock) ? Math.max(0, Math.floor(body.stock)) : 0,
+    stock: totalSizeStock(normalizeProductSizes(body)) ?? (Number.isFinite(body.stock) ? Math.max(0, Math.floor(body.stock)) : 0),
+    sizes: normalizeProductSizes(body),
     image: body.image || normalizeProductImages(body)[0] || "",
     imagePublicId: body.imagePublicId || "",
     images: normalizeProductImages(body),
@@ -202,7 +216,11 @@ app.patch("/api/admin/products/:id", requireAdminPermission("manageProducts"), a
   for (const key of PRODUCT_FIELDS) {
     if (key in body) update[key] = body[key];
   }
-  if (update.stock !== undefined) update.stock = Math.max(0, Math.floor(Number(update.stock) || 0));
+  if (update.sizes !== undefined) {
+    update.sizes = normalizeProductSizes(update);
+    update.stock = totalSizeStock(update.sizes) ?? Math.max(0, Math.floor(Number(update.stock) || 0));
+  } else if (update.stock !== undefined) update.stock = Math.max(0, Math.floor(Number(update.stock) || 0));
+  if (update.productCode !== undefined) update.productCode = String(update.productCode || "").trim().slice(0, 80);
   if (update.price !== undefined) update.price = Number(update.price);
   if (update.isFeatured !== undefined) update.isFeatured = update.isFeatured === true;
   if (update.images !== undefined) {
@@ -210,6 +228,7 @@ app.patch("/api/admin/products/:id", requireAdminPermission("manageProducts"), a
     update.images = normalized;
     if (normalized.length && !update.image) update.image = normalized[0];
   }
+  if (body.productCode === undefined || !String(body.productCode || "").trim()) { const current = await fsGet(c.env, `products/${id}`); if (current && !current.productCode) update.productCode = `AC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`; else if (body.productCode !== undefined && !String(body.productCode || "").trim()) update.productCode = current?.productCode || `AC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`; }
   if (Object.keys(update).length === 0) return c.json({ error: "No valid fields to update" }, 400);
 
   try {
@@ -599,9 +618,11 @@ app.post("/api/orders", requireAuth, async (c) => {
   const quantities = new Map();
   for (const line of items) {
     const id = String(line?.id || "").trim();
+    const size = String(line?.size || "").trim();
     const qty = Math.max(1, Math.floor(Number(line?.qty) || 1));
     if (!id) return c.json({ error: "Invalid product in cart" }, 400);
-    quantities.set(id, (quantities.get(id) || 0) + qty);
+    const key = `${id}::${size}`;
+    quantities.set(key, { id, size, qty: (quantities.get(key)?.qty || 0) + qty });
   }
 
   try {
@@ -613,12 +634,20 @@ app.post("/api/orders", requireAuth, async (c) => {
       let total = 0;
       let subtotal = 0;
 
-      for (const [id, qty] of quantities) {
+      for (const { id, size, qty } of quantities.values()) {
         const product = await get(`products/${id}`);
         if (!product) throw Object.assign(new Error(`Product ${id} not found`), { status: 404 });
 
         const currentStock = Math.max(0, Math.floor(Number(product.stock) || 0));
         const currentSold = Number.isFinite(product.sold) ? product.sold : 0;
+        const sizes = Array.isArray(product.sizes) ? product.sizes.map((x) => ({ size: String(x?.size || ""), stock: Math.max(0, Math.floor(Number(x?.stock) || 0)) })) : [];
+        if (sizes.length) {
+          if (!size) throw Object.assign(new Error(`Please select a size for "${product.name}"`), { status: 400 });
+          const selected = sizes.find((x) => x.size === size);
+          if (!selected) throw Object.assign(new Error(`Size ${size} is not available for "${product.name}"`), { status: 400 });
+          if (selected.stock < qty) throw Object.assign(new Error(`"${product.name}" size ${size} is out of stock. Available: ${selected.stock}`), { status: 409 });
+          selected.stock -= qty;
+        }
         const price = Number(product.price);
         if (!Number.isFinite(price) || price < 0) {
           throw Object.assign(new Error(`Product "${product.name}" has an invalid price`), { status: 400 });
@@ -637,12 +666,13 @@ app.post("/api/orders", requireAuth, async (c) => {
         // helper exposes the exact name so renamed/project-specific paths are safe.
         stockWrites[stockWrites.length - 1].update.name = product.resourceName || `projects/${c.env.FIREBASE_PROJECT_ID}/databases/(default)/documents/products/${id}`;
         stockWrites[stockWrites.length - 1].update.fields = {
-          stock: { integerValue: String(currentStock - qty) },
+          stock: { integerValue: String(sizes.length ? sizes.reduce((sum, x) => sum + x.stock, 0) : currentStock - qty) },
           sold: { doubleValue: currentSold + qty },
+          ...(sizes.length ? { sizes: { arrayValue: { values: sizes.map((x) => ({ mapValue: { fields: { size: { stringValue: x.size }, stock: { integerValue: String(x.stock) } } } })) } } } : {}),
         };
-        stockWrites[stockWrites.length - 1].updateMask = { fieldPaths: ["stock", "sold"] };
+        stockWrites[stockWrites.length - 1].updateMask = { fieldPaths: sizes.length ? ["stock", "sold", "sizes"] : ["stock", "sold"] };
 
-        orderItems.push({ id: product.id, productCode: product.productCode || product.id, name: product.name, price, image: product.image || "", qty });
+        orderItems.push({ id: product.id, productCode: product.productCode || product.id, name: product.name, price, image: product.image || "", size: size || "", qty });
         subtotal += price * qty;
       }
 
@@ -780,7 +810,15 @@ app.patch("/api/admin/orders/:id", requireAdminPermission("manageOrders"), async
         if (!product) break; // Product may have been permanently removed.
         try {
           const restoredSold = Math.max(0, (Number.isFinite(product.sold) ? product.sold : 0) - qty);
-          await fsPatch(c.env, `products/${item.id}`, { stock: Math.max(0, Math.floor(Number(product.stock) || 0)) + qty, sold: restoredSold }, product.updateTime);
+          const sizes = Array.isArray(product.sizes) ? product.sizes.map((x) => ({ size: String(x?.size || ""), stock: Math.max(0, Math.floor(Number(x?.stock) || 0)) })) : [];
+          if (sizes.length && item.size) {
+            const selected = sizes.find((x) => x.size === item.size);
+            if (selected) selected.stock += qty;
+            const restoredStock = sizes.reduce((sum, x) => sum + x.stock, 0);
+            await fsPatch(c.env, `products/${item.id}`, { stock: restoredStock, sizes, sold: restoredSold }, product.updateTime);
+          } else {
+            await fsPatch(c.env, `products/${item.id}`, { stock: Math.max(0, Math.floor(Number(product.stock) || 0)) + qty, sold: restoredSold }, product.updateTime);
+          }
           break;
         } catch (e) {
           if (e.status === 400 || e.status === 409) {
@@ -1031,7 +1069,9 @@ app.patch("/api/admin/membership-requests/:id", requireAdminPermission("manageMe
     const existing=await fsGet(c.env,`memberships/${cur.uid}`).catch(()=>null);
     const membership={uid:cur.uid,name:cur.name||"Member",email:cur.email||"",phone:cur.phone||"",status:"active",coinBalance:Math.max(0,Math.floor(Number(existing?.coinBalance)||0)),joinedAt:existing?.joinedAt||now,approvedAt:now,updatedAt:now};
     const result=existing?await fsPatch(c.env,`memberships/${cur.uid}`,membership):await fsCreate(c.env,"memberships",membership,cur.uid);
-    await fsCreate(c.env,"messages",{uid:cur.uid,email:cur.email||"",from:"admin",text:"Your ArtCanvas membership request has been approved. Welcome to the ArtCanvas Member community.",seenByAdmin:true,createdAt:now}).catch(()=>{});
+    const approvalText="Your ArtCanvas membership request has been approved. Welcome to the ArtCanvas Member community.";
+    await fsCreate(c.env,"messages",{uid:cur.uid,email:cur.email||"",from:"admin",text:approvalText,seenByAdmin:true,createdAt:now}).catch(()=>{});
+    if (cur.email) await sendTransactionalEmail(c.env,{to:cur.email,subject:"Your ArtCanvas membership is approved",text:approvalText}).catch(()=>({sent:false}));
     await recordAudit(c.env,c.get("user"),"membership_approved","membership",cur.uid,cur.name||cur.email,"Membership approved");
     return c.json({ ...saved, membership:safeMembership(result) });
   }
@@ -1085,17 +1125,25 @@ app.patch("/api/admin/coin-rules/:productId", requireAdminPermission("manageMemb
 app.post("/api/admin/members/:uid/message", requireAdminPermission("manageMembership"), async (c) => {
   const uid=c.req.param("uid"), b=await c.req.json().catch(()=>({})); const text=String(b?.text||"").trim().slice(0,3000); if(!text)return c.json({error:"Message is required"},400);
   const member=await fsGet(c.env,`memberships/${uid}`); if(!member)return c.json({error:"Member not found"},404);
-  const msg=await fsCreate(c.env,"messages",{uid,email:member.email||"",from:"admin",text,seenByAdmin:true,createdAt:new Date().toISOString()});
-  return c.json(msg,201);
+  if(!member.email) return c.json({error:"This member does not have an email address."},400);
+  const emailResult=await sendTransactionalEmail(c.env,{to:member.email,subject:"A message from ArtCanvas",text});
+  if(!emailResult.sent) return c.json({error: emailResult.reason || "Could not send email", emailSent:false},503);
+  const msg=await fsCreate(c.env,"messages",{uid,email:member.email||"",from:"admin",text,seenByAdmin:true,emailSent:true,emailId:emailResult.id||null,createdAt:new Date().toISOString()});
+  return c.json({...msg,emailSent:true},201);
 });
 
-// Broadcast an in-app announcement to every active member.
+// Broadcast an announcement to every active member by in-app message + email.
 app.post("/api/admin/members/broadcast", requireAdminPermission("manageMembership"), async (c) => {
   const b=await c.req.json().catch(()=>({})); const text=String(b?.text||"").trim().slice(0,3000); if(!text)return c.json({error:"Announcement message is required"},400);
-  const members=(await fsList(c.env,"memberships")).filter(x=>x.status==="active"); const now=new Date().toISOString(); let sent=0;
-  for(const m of members){await fsCreate(c.env,"messages",{uid:m.uid,email:m.email||"",from:"admin",text,seenByAdmin:true,createdAt:now});sent++;}
-  await recordAudit(c.env,c.get("user"),"membership_broadcast","membership","all","All members",`Announcement sent to ${sent} active members`);
-  return c.json({ok:true,sent});
+  const members=(await fsList(c.env,"memberships")).filter(x=>x.status==="active"); const now=new Date().toISOString(); let sent=0, emailSent=0, failed=0;
+  for(const m of members){
+    const emailResult=await sendTransactionalEmail(c.env,{to:m.email,subject:"ArtCanvas member announcement",text}).catch(e=>({sent:false,reason:String(e?.message||e)}));
+    if(emailResult.sent) emailSent++; else failed++;
+    await fsCreate(c.env,"messages",{uid:m.uid,email:m.email||"",from:"admin",text,seenByAdmin:true,emailSent:emailResult.sent===true,emailId:emailResult.id||null,createdAt:now});
+    sent++;
+  }
+  await recordAudit(c.env,c.get("user"),"membership_broadcast","membership","all","All members",`Announcement sent to ${sent} active members; ${emailSent} emails sent`);
+  return c.json({ok:true,sent,emailSent,failed});
 });
 
 // ---------- circulation ----------
@@ -1119,6 +1167,51 @@ app.delete("/api/admin/contact/:id", requireAdminPermission("manageContact"), as
 // ---------- messages (client <-> studio) ----------
 // Every message document: { uid, email, from: "user" | "admin", text, createdAt }
 // A "thread" is simply all messages sharing the same uid (the client's Firebase uid).
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function sendTransactionalEmail(env, { to, subject, text, preheader = "" }) {
+  const recipient = String(to || "").trim().toLowerCase();
+  const apiKey = String(env.RESEND_API_KEY || "").trim();
+  const from = String(env.RESEND_FROM_EMAIL || "").trim();
+  if (!recipient) return { sent: false, skipped: true, reason: "No recipient email" };
+  if (!apiKey || !from) return { sent: false, skipped: true, reason: "Email provider is not configured" };
+
+  const safeText = String(text || "").trim();
+  const safeSubject = String(subject || "ArtCanvas message").trim().slice(0, 200);
+  const htmlBody = escapeHtml(safeText).replace(/\n/g, "<br />");
+  const html = `<!doctype html><html><body style="margin:0;background:#f7f4ee;font-family:Arial,Helvetica,sans-serif;color:#171717"><div style="max-width:620px;margin:32px auto;padding:0 18px"><div style="background:#fff;border:1px solid #e7e1d8;border-radius:18px;overflow:hidden"><div style="padding:24px 28px;border-bottom:1px solid #eee7de"><div style="font-size:24px;font-weight:700;letter-spacing:-.04em">ArtCanvas<span style="font-size:12px;font-weight:500;letter-spacing:.08em;color:#777"> GALLERY</span></div></div><div style="padding:28px"><div style="font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#8b857c;margin-bottom:12px">Message from ArtCanvas</div><div style="font-size:18px;font-weight:600;margin-bottom:18px">${escapeHtml(safeSubject)}</div><div style="font-size:15px;line-height:1.75;color:#444">${htmlBody}</div></div><div style="padding:18px 28px;border-top:1px solid #eee7de;font-size:12px;color:#888">This email was sent from your ArtCanvas member account.</div></div></div></body></html>`;
+
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      from,
+      to: [recipient],
+      subject: safeSubject,
+      text: safeText,
+      html,
+      ...(preheader ? { headers: { "X-Entity-Ref-ID": preheader.slice(0, 100) } } : {}),
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data?.message || data?.error || `Email provider returned ${response.status}`;
+    return { sent: false, skipped: false, reason: String(detail).slice(0, 500) };
+  }
+  return { sent: true, skipped: false, id: data?.id || null };
+}
 
 function cleanMessageText(body) {
   const text = typeof body?.text === "string" ? body.text.trim() : "";
@@ -1253,15 +1346,39 @@ app.post("/api/admin/messages/:uid", requireAdminPermission("manageMessages"), a
   const profile = await fsGet(c.env, `users/${uid}`);
   const email = profile?.email || (typeof body?.email === "string" ? body.email : "") || "";
 
+  if (!email) return c.json({ error: "This client does not have an email address." }, 400);
+
+  // Always save the admin reply to the ArtCanvas conversation first. Email is
+  // an additional delivery channel and must not prevent the in-app message
+  // from reaching the client when Resend is unavailable/misconfigured.
+  let emailResult = { sent: false, skipped: true, reason: "Email not attempted" };
+  try {
+    emailResult = await sendTransactionalEmail(c.env, {
+      to: email,
+      subject: "A message from ArtCanvas",
+      text,
+    });
+  } catch (err) {
+    emailResult = { sent: false, skipped: false, reason: String(err?.message || err || "Email delivery failed").slice(0, 500) };
+  }
+
   const message = await fsCreate(c.env, "messages", {
     uid,
     email,
     from: "admin",
     text,
     seenByAdmin: true,
+    emailSent: emailResult.sent === true,
+    emailId: emailResult.id || null,
+    emailError: emailResult.sent === true ? "" : (emailResult.reason || "Email delivery failed"),
     createdAt: new Date().toISOString(),
   });
-  return c.json(message, 201);
+
+  return c.json({
+    ...message,
+    emailSent: emailResult.sent === true,
+    emailWarning: emailResult.sent === true ? "" : (emailResult.reason || "Message delivered in-app; email delivery was not successful."),
+  }, 201);
 });
 
 app.onError((err, c) => {

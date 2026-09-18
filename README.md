@@ -55,6 +55,26 @@ Edit `wrangler.toml` → `[vars]`:
   call this API (your Cloudflare Pages URL + `http://localhost:5173` for dev)
 - `CLOUDINARY_CLOUD_NAME` — your Cloudinary cloud name
 
+## 3.5 Configure member email delivery (Resend)
+
+Admin messages to members are sent through Resend from the backend, so the Resend API key never reaches the browser. The Worker calls Resend's email API directly.
+
+Add these values to `.dev.vars` for local development:
+
+```bash
+RESEND_API_KEY=re_xxxxxxxxxxxxxxxxx
+RESEND_FROM_EMAIL=ArtCanvas <noreply@your-verified-domain.com>
+```
+
+For production, set them as Cloudflare Worker secrets:
+
+```bash
+wrangler secret put RESEND_API_KEY
+wrangler secret put RESEND_FROM_EMAIL
+```
+
+The sender address/domain must be allowed by your Resend account. Resend documents direct REST email sending and Cloudflare Workers integration.
+
 ## 4. Run locally
 
 ```bash
